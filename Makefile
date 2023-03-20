@@ -51,8 +51,8 @@ export CGO_ENABLED=0
 
 BINDIR:=/usr/bin/
 
-.DEFAULT_GOAL := build
-.PHONY: clean build format imports lint test unit acceptance prepare-for-pr verify verify-format benchmark 
+# .DEFAULT_GOAL := build
+# .PHONY: clean build format imports lint test unit acceptance prepare-for-pr verify verify-format benchmark 
 
 ## bUild: Build the program
 build: out
