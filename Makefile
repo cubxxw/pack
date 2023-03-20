@@ -1,8 +1,8 @@
 ifeq ($(OS),Windows_NT)
 SHELL:=cmd.exe
 
-# Need BLANK due to makefile parsing of `\\`
-# (see: <https://stackoverflow.com/questions/54733231/how-to-escape-a-backslash-in-the-end-to-mean-literal-backslash-in-makefile/54733416#54733416>)
+# Need BLANK due to makefile parsing of `\`
+# (see: https://stackoverflow.com/questions/54733231/how-to-escape-a-backslash-in-the-end-to-mean-literal-backslash-in-makefile/54733416#54733416)
 BLANK:=
 
 # Define variable named `/` to represent OS path separator (usable as `$/` in this file)
@@ -133,8 +133,8 @@ package: out
 
 ## install: Install the program to the system
 install:
-	mkdir -p ${DESTDIR}${BINDIR}
-	cp ./out/$(PACK_BIN) ${DESTDIR}${BINDIR}/
+	@mkdir -p ${DESTDIR}${BINDIR}
+	@cp ./out/$(PACK_BIN) ${DESTDIR}${BINDIR}/
 
 ## install-mockgen: Used only by apt-get install when installing ubuntu ppa
 install-mockgen:
