@@ -13,11 +13,12 @@ jobs:
     name: Run Go benchmark example
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Set up go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: "1.19"
+          check-latest: true
+          go-version-file: 'go.mod'
       - name: Set up go env
         run: |
           echo "GOPATH=$(go env GOPATH)" >> $GITHUB_ENV
@@ -25,6 +26,7 @@ jobs:
         shell: bash
       - name: Run benchmark
         run: |
+             git clone https://github.com/buildpacks/samples.git
              mkdir out || (exit 0)
              go test -bench=. -benchtime=1s ./benchmarks/... -tags=benchmarks | tee ./out/benchmark.txt
 
@@ -40,4 +42,4 @@ jobs:
           alert-threshold: '200%'
           comment-on-alert: true
           fail-on-alert: true
-          alert-comment-cc-users: '@edithwuly'
+          alert-comment-cc-users: '@buildpacks/platform-maintainers'

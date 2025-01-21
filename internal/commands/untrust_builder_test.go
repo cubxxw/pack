@@ -124,12 +124,12 @@ func testUntrustBuilderCommand(t *testing.T, when spec.G, it spec.S) {
 
 		when("builder is a suggested builder", func() {
 			it("does nothing and reports that ", func() {
-				builder := "paketobuildpacks/builder:base"
+				builder := "paketobuildpacks/builder-jammy-base"
 				command := commands.UntrustBuilder(logger, config.Config{}, configPath)
 				command.SetArgs([]string{builder})
 
 				err := command.Execute()
-				h.AssertError(t, err, fmt.Sprintf("Builder %s is a suggested builder, and is trusted by default", style.Symbol(builder)))
+				h.AssertError(t, err, fmt.Sprintf("Builder %s is a known trusted builder. Currently pack doesn't support making these builders untrusted", style.Symbol(builder)))
 			})
 		})
 	})

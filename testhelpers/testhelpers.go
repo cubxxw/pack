@@ -24,7 +24,8 @@ import (
 	"github.com/buildpacks/imgutil/fakes"
 
 	dockertypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
+	dcontainer "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -33,6 +34,7 @@ import (
 	"github.com/heroku/color"
 	"github.com/pkg/errors"
 
+	"github.com/buildpacks/pack/internal/container"
 	"github.com/buildpacks/pack/internal/stringset"
 	"github.com/buildpacks/pack/internal/style"
 	"github.com/buildpacks/pack/pkg/archive"
@@ -175,6 +177,33 @@ func AssertNotContains(t *testing.T, actual, expected string) {
 	t.Helper()
 	if strings.Contains(actual, expected) {
 		t.Fatalf("Expected '%s' to not contain '%s'", actual, expected)
+	}
+}
+
+type KeyValue[k comparable, v any] struct {
+	key   k
+	value v
+}
+
+func NewKeyValue[k comparable, v any](key k, value v) KeyValue[k, v] {
+	return KeyValue[k, v]{key: key, value: value}
+}
+
+func AssertMapContains[key comparable, value any](t *testing.T, actual map[key]value, expected ...KeyValue[key, value]) {
+	t.Helper()
+	for _, i := range expected {
+		if v, ok := actual[i.key]; !ok || !reflect.DeepEqual(v, i.value) {
+			t.Fatalf("Expected %s to contain elements %s", reflect.ValueOf(actual), reflect.ValueOf(expected))
+		}
+	}
+}
+
+func AssertMapNotContains[key comparable, value any](t *testing.T, actual map[key]value, expected ...KeyValue[key, value]) {
+	t.Helper()
+	for _, i := range expected {
+		if v, ok := actual[i.key]; ok && reflect.DeepEqual(v, i.value) {
+			t.Fatalf("Expected %s to not contain elements %s", reflect.ValueOf(actual), reflect.ValueOf(expected))
+		}
 	}
 }
 
@@ -426,7 +455,7 @@ func DockerRmi(dockerCli client.CommonAPIClient, repoNames ...string) error {
 		_, e := dockerCli.ImageRemove(
 			ctx,
 			name,
-			dockertypes.ImageRemoveOptions{Force: true, PruneChildren: true},
+			image.RemoveOptions{Force: true, PruneChildren: true},
 		)
 		if e != nil && err == nil {
 			err = e
@@ -436,7 +465,7 @@ func DockerRmi(dockerCli client.CommonAPIClient, repoNames ...string) error {
 }
 
 func PushImage(dockerCli client.CommonAPIClient, ref string, registryConfig *TestRegistryConfig) error {
-	rc, err := dockerCli.ImagePush(context.Background(), ref, dockertypes.ImagePushOptions{RegistryAuth: registryConfig.RegistryAuth()})
+	rc, err := dockerCli.ImagePush(context.Background(), ref, image.PushOptions{RegistryAuth: registryConfig.RegistryAuth()})
 	if err != nil {
 		return errors.Wrap(err, "pushing image")
 	}
@@ -525,7 +554,7 @@ func RunE(cmd *exec.Cmd) (string, error) {
 }
 
 func PullImageWithAuth(dockerCli client.CommonAPIClient, ref, registryAuth string) error {
-	rc, err := dockerCli.ImagePull(context.Background(), ref, dockertypes.ImagePullOptions{RegistryAuth: registryAuth})
+	rc, err := dockerCli.ImagePull(context.Background(), ref, image.PullOptions{RegistryAuth: registryAuth})
 	if err != nil {
 		return err
 	}
@@ -634,9 +663,9 @@ func SkipUnless(t *testing.T, expression bool, reason string) {
 }
 
 func RunContainer(ctx context.Context, dockerCli client.CommonAPIClient, id string, stdout io.Writer, stderr io.Writer) error {
-	bodyChan, errChan := dockerCli.ContainerWait(ctx, id, container.WaitConditionNextExit)
+	bodyChan, errChan := container.ContainerWaitWrapper(ctx, dockerCli, id, dcontainer.WaitConditionNextExit)
 
-	logs, err := dockerCli.ContainerAttach(ctx, id, dockertypes.ContainerAttachOptions{
+	logs, err := dockerCli.ContainerAttach(ctx, id, dcontainer.AttachOptions{
 		Stream: true,
 		Stdout: true,
 		Stderr: true,
@@ -645,7 +674,7 @@ func RunContainer(ctx context.Context, dockerCli client.CommonAPIClient, id stri
 		return err
 	}
 
-	if err := dockerCli.ContainerStart(ctx, id, dockertypes.ContainerStartOptions{}); err != nil {
+	if err := dockerCli.ContainerStart(ctx, id, dcontainer.StartOptions{}); err != nil {
 		return errors.Wrap(err, "container start")
 	}
 

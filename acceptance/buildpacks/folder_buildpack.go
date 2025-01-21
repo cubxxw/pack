@@ -45,4 +45,7 @@ var (
 	BpFolderSimpleLayersParent = folderBuildModule{name: "simple-layers-parent-buildpack"}
 	BpFolderSimpleLayers       = folderBuildModule{name: "simple-layers-buildpack"}
 	ExtFolderSimpleLayers      = folderBuildModule{name: "simple-layers-extension"}
+	MetaBpFolder               = folderBuildModule{name: "meta-buildpack"}
+	MetaBpDependency           = folderBuildModule{name: "meta-buildpack-dependency"}
+	MultiPlatformFolderBP      = folderBuildModule{name: "multi-platform-buildpack"}
 )

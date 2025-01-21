@@ -14,9 +14,9 @@ jobs:
   update-tap:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Checkout tap
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: buildpack/homebrew-tap
           path: homebrew-tap
@@ -24,7 +24,7 @@ jobs:
       - name: Copy pack.rb
         run: cp .github/workflows/delivery/homebrew/pack.rb homebrew-tap/Formula/pack.rb
       - name: Lookup assets
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         id: assets
         with:
           script: |

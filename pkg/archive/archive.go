@@ -83,12 +83,7 @@ func GenerateTarWithWriter(genFn func(TarWriter) error, twf TarWriterFactory) io
 		errChan <- closeErr
 	}()
 
-	closed := false
 	return ioutils.NewReadCloserWrapper(pr, func() error {
-		if closed {
-			return errors.New("reader already closed")
-		}
-
 		var completeErr error
 
 		// closing the reader ensures that if anything attempts
@@ -102,7 +97,6 @@ func GenerateTarWithWriter(genFn func(TarWriter) error, twf TarWriterFactory) io
 			completeErr = aggregateError(completeErr, err)
 		}
 
-		closed = true
 		return completeErr
 	})
 }
@@ -169,20 +163,14 @@ func ReadTarEntry(rc io.Reader, entryPath string) (*tar.Header, []byte, error) {
 // contents will be placed. The includeRoot param sets the permissions and metadata on the root file.
 func WriteDirToTar(tw TarWriter, srcDir, basePath string, uid, gid int, mode int64, normalizeModTime, includeRoot bool, fileFilter func(string) bool) error {
 	if includeRoot {
-		rootHeader := &tar.Header{
-			Typeflag: tar.TypeDir,
-			Name:     basePath,
-			Mode:     mode,
-		}
-		if rootHeader.Mode == -1 {
-			rootHeader.Mode = int64(fs.ModePerm &^ Umask)
-		}
-		finalizeHeader(rootHeader, uid, gid, mode, normalizeModTime)
-		if err := tw.WriteHeader(rootHeader); err != nil {
+		mode := modePermIfNegativeMode(mode)
+		err := writeRootHeader(tw, basePath, mode, uid, gid, normalizeModTime)
+		if err != nil {
 			return err
 		}
 	}
 
+	hardLinkFiles := map[uint64]string{}
 	return filepath.Walk(srcDir, func(file string, fi os.FileInfo, err error) error {
 		var relPath string
 		if fileFilter != nil {
@@ -194,31 +182,9 @@ func WriteDirToTar(tw TarWriter, srcDir, basePath string, uid, gid int, mode int
 				return nil
 			}
 		}
+
 		if err != nil {
 			return err
-		}
-
-		if fi.Mode()&os.ModeSocket != 0 {
-			return nil
-		}
-
-		var header *tar.Header
-		if fi.Mode()&os.ModeSymlink != 0 {
-			target, err := os.Readlink(file)
-			if err != nil {
-				return err
-			}
-
-			// Ensure that symlinks have Linux link names, independent of source OS
-			header, err = tar.FileInfoHeader(fi, filepath.ToSlash(target))
-			if err != nil {
-				return err
-			}
-		} else {
-			header, err = tar.FileInfoHeader(fi, fi.Name())
-			if err != nil {
-				return err
-			}
 		}
 
 		if relPath == "" {
@@ -231,14 +197,32 @@ func WriteDirToTar(tw TarWriter, srcDir, basePath string, uid, gid int, mode int
 			return nil
 		}
 
-		header.Name = filepath.ToSlash(filepath.Join(basePath, relPath))
-		finalizeHeader(header, uid, gid, mode, normalizeModTime)
+		if hasModeSocket(fi) != 0 {
+			return nil
+		}
 
-		if err := tw.WriteHeader(header); err != nil {
+		var header *tar.Header
+		if hasModeSymLink(fi) {
+			if header, err = getHeaderFromSymLink(file, fi); err != nil {
+				return err
+			}
+		} else {
+			if header, err = tar.FileInfoHeader(fi, fi.Name()); err != nil {
+				return err
+			}
+		}
+
+		header.Name = getHeaderNameFromBaseAndRelPath(basePath, relPath)
+		if err = processHardLinks(file, fi, hardLinkFiles, header); err != nil {
 			return err
 		}
 
-		if fi.Mode().IsRegular() {
+		err = writeHeader(header, uid, gid, mode, normalizeModTime, tw)
+		if err != nil {
+			return err
+		}
+
+		if hasRegularMode(fi) && header.Size > 0 {
 			f, err := os.Open(filepath.Clean(file))
 			if err != nil {
 				return err
@@ -252,6 +236,35 @@ func WriteDirToTar(tw TarWriter, srcDir, basePath string, uid, gid int, mode int
 
 		return nil
 	})
+}
+
+// processHardLinks determine if the given file has hard-links associated with it, the given hardLinkFiles map keeps track
+// of any previous hard-link previously processed. In case the hard-link was already found, the header will be updated with
+// the previous information otherwise the new hard-link found will be tracked into the map
+func processHardLinks(file string, fi os.FileInfo, hardLinkFiles map[uint64]string, header *tar.Header) error {
+	var (
+		err       error
+		hardlinks bool
+		inode     uint64
+	)
+	if hardlinks, err = hasHardlinks(fi, file); err != nil {
+		return err
+	}
+	if hardlinks {
+		inode, err = getInodeFromStat(fi.Sys(), file)
+		if err != nil {
+			return err
+		}
+
+		if processedPath, ok := hardLinkFiles[inode]; ok {
+			header.Typeflag = tar.TypeLink
+			header.Linkname = processedPath
+			header.Size = 0
+		} else {
+			hardLinkFiles[inode] = header.Name
+		}
+	}
+	return nil
 }
 
 // WriteZipToTar writes the contents of a zip file to a tar writer.
@@ -334,26 +347,6 @@ func WriteZipToTar(tw TarWriter, srcZip, basePath string, uid, gid int, mode int
 	return nil
 }
 
-func isFatFile(header zip.FileHeader) bool {
-	var (
-		creatorFAT  uint16 = 0 // nolint:revive
-		creatorVFAT uint16 = 14
-	)
-
-	// This identifies FAT files, based on the `zip` source: https://golang.org/src/archive/zip/struct.go
-	firstByte := header.CreatorVersion >> 8
-	return firstByte == creatorFAT || firstByte == creatorVFAT
-}
-
-func finalizeHeader(header *tar.Header, uid, gid int, mode int64, normalizeModTime bool) {
-	NormalizeHeader(header, normalizeModTime)
-	if mode != -1 {
-		header.Mode = mode
-	}
-	header.Uid = uid
-	header.Gid = gid
-}
-
 // NormalizeHeader normalizes a tar.Header
 //
 // Normalizes the following:
@@ -385,4 +378,87 @@ func IsZip(path string) (bool, error) {
 	default:
 		return false, err
 	}
+}
+
+func isFatFile(header zip.FileHeader) bool {
+	var (
+		creatorFAT  uint16 = 0 // nolint:revive
+		creatorVFAT uint16 = 14
+	)
+
+	// This identifies FAT files, based on the `zip` source: https://golang.org/src/archive/zip/struct.go
+	firstByte := header.CreatorVersion >> 8
+	return firstByte == creatorFAT || firstByte == creatorVFAT
+}
+
+func finalizeHeader(header *tar.Header, uid, gid int, mode int64, normalizeModTime bool) {
+	NormalizeHeader(header, normalizeModTime)
+	if mode != -1 {
+		header.Mode = mode
+	}
+	header.Uid = uid
+	header.Gid = gid
+}
+
+func hasRegularMode(fi os.FileInfo) bool {
+	return fi.Mode().IsRegular()
+}
+
+func getHeaderNameFromBaseAndRelPath(basePath string, relPath string) string {
+	return filepath.ToSlash(filepath.Join(basePath, relPath))
+}
+
+func writeHeader(header *tar.Header, uid int, gid int, mode int64, normalizeModTime bool, tw TarWriter) error {
+	finalizeHeader(header, uid, gid, mode, normalizeModTime)
+
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func getHeaderFromSymLink(file string, fi os.FileInfo) (*tar.Header, error) {
+	target, err := os.Readlink(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure that symlinks have Linux link names, independent of source OS
+	header, err := tar.FileInfoHeader(fi, filepath.ToSlash(target))
+	if err != nil {
+		return nil, err
+	}
+	return header, nil
+}
+
+func hasModeSymLink(fi os.FileInfo) bool {
+	return fi.Mode()&os.ModeSymlink != 0
+}
+
+func hasModeSocket(fi os.FileInfo) fs.FileMode {
+	return fi.Mode() & os.ModeSocket
+}
+
+func writeRootHeader(tw TarWriter, basePath string, mode int64, uid int, gid int, normalizeModTime bool) error {
+	rootHeader := &tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     basePath,
+		Mode:     mode,
+	}
+
+	finalizeHeader(rootHeader, uid, gid, mode, normalizeModTime)
+
+	if err := tw.WriteHeader(rootHeader); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func modePermIfNegativeMode(mode int64) int64 {
+	if mode == -1 {
+		return int64(fs.ModePerm)
+	}
+	return mode
 }
