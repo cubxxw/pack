@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	dockertypes "github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
+	dockerregistry "github.com/docker/docker/api/types/registry"
 	"github.com/docker/go-connections/nat"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -119,8 +119,8 @@ func waitForRegistryToBeAvailable(t *testing.T, registryConfig *TestRegistryConf
 	}
 }
 
-func (rc *TestRegistryConfig) AuthConfig() dockertypes.AuthConfig {
-	return dockertypes.AuthConfig{
+func (rc *TestRegistryConfig) AuthConfig() dockerregistry.AuthConfig {
+	return dockerregistry.AuthConfig{
 		Username:      rc.username,
 		Password:      rc.password,
 		ServerAddress: RegistryHost(rc.RunRegistryHost, rc.RunRegistryPort),
@@ -129,7 +129,7 @@ func (rc *TestRegistryConfig) AuthConfig() dockertypes.AuthConfig {
 
 func (rc *TestRegistryConfig) Login(t *testing.T, username string, password string) {
 	Eventually(t, func() bool {
-		_, err := dockerCli(t).RegistryLogin(context.Background(), dockertypes.AuthConfig{
+		_, err := dockerCli(t).RegistryLogin(context.Background(), dockerregistry.AuthConfig{
 			Username:      username,
 			Password:      password,
 			ServerAddress: RegistryHost(rc.RunRegistryHost, rc.RunRegistryPort),
@@ -165,10 +165,10 @@ func startRegistry(t *testing.T, runRegistryName, username, password string) (st
 		},
 	}, nil, nil, runRegistryName)
 	AssertNil(t, err)
-	err = dockerCli(t).CopyToContainer(ctx, ctr.ID, "/", htpasswdTar, dockertypes.CopyToContainerOptions{})
+	err = dockerCli(t).CopyToContainer(ctx, ctr.ID, "/", htpasswdTar, dockercontainer.CopyToContainerOptions{})
 	AssertNil(t, err)
 
-	err = dockerCli(t).ContainerStart(ctx, ctr.ID, dockertypes.ContainerStartOptions{})
+	err = dockerCli(t).ContainerStart(ctx, ctr.ID, dockercontainer.StartOptions{})
 	AssertNil(t, err)
 
 	runRegistryPort, err := waitForPortBinding(t, ctr.ID, "5000/tcp", 30*time.Second)

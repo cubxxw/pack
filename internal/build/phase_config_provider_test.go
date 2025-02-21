@@ -3,9 +3,7 @@ package build_test
 import (
 	"bytes"
 	"io"
-	"math/rand"
 	"testing"
-	"time"
 
 	ifakes "github.com/buildpacks/imgutil/fakes"
 	"github.com/docker/docker/api/types/container"
@@ -23,8 +21,6 @@ import (
 )
 
 func TestPhaseConfigProvider(t *testing.T) {
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	color.Disable(true)
 	defer color.Disable(false)
 
@@ -63,6 +59,8 @@ func testPhaseConfigProvider(t *testing.T, when spec.G, it spec.S) {
 			h.AssertSliceContainsMatch(t, phaseConfigProvider.HostConfig().Binds, "pack-app-.*:/workspace")
 
 			h.AssertEq(t, phaseConfigProvider.HostConfig().Isolation, container.IsolationEmpty)
+			h.AssertEq(t, phaseConfigProvider.HostConfig().UsernsMode, container.UsernsMode("host"))
+			h.AssertSliceContains(t, phaseConfigProvider.HostConfig().SecurityOpt, "no-new-privileges=true")
 		})
 
 		when("building for Windows", func() {
@@ -76,6 +74,7 @@ func testPhaseConfigProvider(t *testing.T, when spec.G, it spec.S) {
 				phaseConfigProvider := build.NewPhaseConfigProvider("some-name", lifecycle)
 
 				h.AssertEq(t, phaseConfigProvider.HostConfig().Isolation, container.IsolationProcess)
+				h.AssertSliceNotContains(t, phaseConfigProvider.HostConfig().SecurityOpt, "no-new-privileges=true")
 			})
 		})
 

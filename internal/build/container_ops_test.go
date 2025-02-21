@@ -6,16 +6,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/buildpacks/lifecycle/platform"
-	"github.com/docker/docker/api/types"
+	"github.com/buildpacks/lifecycle/platform/files"
 	dcontainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
@@ -31,8 +28,6 @@ import (
 
 // TestContainerOperations are integration tests for the container operations against a docker daemon
 func TestContainerOperations(t *testing.T) {
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	color.Disable(true)
 	defer color.Disable(false)
 
@@ -173,17 +168,9 @@ lrwxrwxrwx    1 123      456 (.*) fake-app-symlink -> fake-app-file
 (.*)    <DIR>          ...                    some-vol
 `)
 				} else {
-					if runtime.GOOS == "windows" {
-						// Expected LCOW results
-						h.AssertContainsMatch(t, outBuf.String(), `
+					h.AssertContainsMatch(t, outBuf.String(), `
 drwxrwxrwx    2 123      456 (.*) some-vol
 `)
-					} else {
-						// Expected results
-						h.AssertContainsMatch(t, outBuf.String(), `
-drwxr-xr-x    2 123      456 (.*) some-vol
-`)
-					}
 				}
 			})
 		})
@@ -576,8 +563,8 @@ drwxr-xr-x    2 123      456 (.*) some-vol
 			h.AssertNil(t, err)
 			defer cleanupContainer(ctx, ctr.ID)
 
-			writeOp := build.WriteProjectMetadata(p, platform.ProjectMetadata{
-				Source: &platform.ProjectSource{
+			writeOp := build.WriteProjectMetadata(p, files.ProjectMetadata{
+				Source: &files.ProjectSource{
 					Type: "project",
 					Version: map[string]interface{}{
 						"declared": "1.0.2",
@@ -621,8 +608,8 @@ drwxr-xr-x    2 123      456 (.*) some-vol
 			h.AssertNil(t, err)
 			defer cleanupContainer(ctx, ctr.ID)
 
-			writeOp := build.WriteProjectMetadata(p, platform.ProjectMetadata{
-				Source: &platform.ProjectSource{
+			writeOp := build.WriteProjectMetadata(p, files.ProjectMetadata{
+				Source: &files.ProjectSource{
 					Type: "project",
 					Version: map[string]interface{}{
 						"declared": "1.0.2",
@@ -650,6 +637,7 @@ drwxr-xr-x    2 123      456 (.*) some-vol
 `)
 		})
 	})
+
 	when("#EnsureVolumeAccess", func() {
 		it("changes owner of volume", func() {
 			h.SkipIf(t, osType != "windows", "no-op for linux")
@@ -720,7 +708,7 @@ func cleanupContainer(ctx context.Context, ctrID string) {
 	}
 
 	// remove container
-	err = ctrClient.ContainerRemove(ctx, ctrID, types.ContainerRemoveOptions{})
+	err = ctrClient.ContainerRemove(ctx, ctrID, dcontainer.RemoveOptions{})
 	if err != nil {
 		return
 	}

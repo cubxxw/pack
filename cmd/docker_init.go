@@ -52,7 +52,7 @@ func tryInitSSHDockerClient() (dockerClient.CommonAPIClient, error) {
 	dockerClientOpts := []dockerClient.Opt{
 		dockerClient.WithVersion(client.DockerAPIVersion),
 		dockerClient.WithHTTPClient(httpClient),
-		dockerClient.WithHost("http://dummy/"),
+		dockerClient.WithHost("http://dummy"),
 		dockerClient.WithDialContext(dialContext),
 	}
 
@@ -70,7 +70,7 @@ func readSecret(prompt string) (pw []byte, err error) {
 		fmt.Fprint(os.Stderr, prompt)
 		pw, err = term.ReadPassword(fd)
 		fmt.Fprintln(os.Stderr)
-		return
+		return pw, err
 	}
 
 	var b [1]byte

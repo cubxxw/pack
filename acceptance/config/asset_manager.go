@@ -1,5 +1,4 @@
 //go:build acceptance
-// +build acceptance
 
 package config
 
@@ -26,7 +25,7 @@ const (
 var (
 	currentPackFixturesDir           = filepath.Join("testdata", "pack_fixtures")
 	previousPackFixturesOverridesDir = filepath.Join("testdata", "pack_previous_fixtures_overrides")
-	lifecycleTgzExp                  = regexp.MustCompile(`lifecycle-v\d+.\d+.\d+\+linux.x86-64.tgz`)
+	lifecycleTgzExp                  = regexp.MustCompile(`lifecycle-v\d+.\d+.\d+(-pre.\d+)?(-rc.\d+)?\+linux.x86-64.tgz`)
 )
 
 type AssetManager struct {

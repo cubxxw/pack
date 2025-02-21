@@ -5,16 +5,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Masterminds/semver"
 	"github.com/buildpacks/imgutil"
@@ -22,16 +21,14 @@ import (
 	"github.com/buildpacks/imgutil/local"
 	"github.com/buildpacks/imgutil/remote"
 	"github.com/buildpacks/lifecycle/api"
-	"github.com/buildpacks/lifecycle/platform"
+	"github.com/buildpacks/lifecycle/platform/files"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/heroku/color"
 	"github.com/onsi/gomega/ghttp"
-	"github.com/pkg/errors"
 	"github.com/sclevine/spec"
 	"github.com/sclevine/spec/report"
 
-	"github.com/buildpacks/pack/internal/build"
 	"github.com/buildpacks/pack/internal/builder"
 	cfg "github.com/buildpacks/pack/internal/config"
 	ifakes "github.com/buildpacks/pack/internal/fakes"
@@ -49,7 +46,6 @@ import (
 func TestBuild(t *testing.T) {
 	color.Disable(true)
 	defer color.Disable(false)
-	rand.Seed(time.Now().UTC().UnixNano())
 	spec.Run(t, "build", testBuild, spec.Report(report.Terminal{}))
 }
 
@@ -154,6 +150,18 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 	})
 
 	when("#Build", func() {
+		when("ephemeral builder is not needed", func() {
+			it("does not create one", func() {
+				h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+					Builder: defaultBuilderName,
+					Image:   "example.com/some/repo:tag",
+				}))
+				h.AssertEq(t, fakeLifecycle.Opts.Builder.Name(), defaultBuilderName)
+				bldr := fakeLifecycle.Opts.Builder.(*builder.Builder)
+				h.AssertNotNil(t, bldr.Save(logger, builder.CreatorMetadata{})) // it shouldn't be possible to save this builder, as that would overwrite the original builder
+			})
+		})
+
 		when("Workspace option", func() {
 			it("uses the specified dir", func() {
 				h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
@@ -523,14 +531,14 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 					h.AssertNil(t, fakeRunImage.SetLabel("io.buildpacks.stack.id", "other.stack"))
 				})
 
-				it("errors", func() {
-					h.AssertError(t, subject.Build(context.TODO(), BuildOptions{
+				it("warning", func() {
+					err := subject.Build(context.TODO(), BuildOptions{
 						Image:    "some/app",
 						Builder:  defaultBuilderName,
 						RunImage: "custom/run",
-					}),
-						"invalid run-image 'custom/run': run-image stack id 'other.stack' does not match builder stack 'some.stack.id'",
-					)
+					})
+					h.AssertNil(t, err)
+					h.AssertContains(t, outBuf.String(), "Warning: deprecated usage of stack")
 				})
 			})
 
@@ -990,85 +998,143 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 				})
 			})
 
+			when("meta-buildpack folder is used", func() {
+				it("resolves buildpack", func() {
+					metaBuildpackFolder := filepath.Join(tmpDir, "meta-buildpack")
+					err := os.Mkdir(metaBuildpackFolder, os.ModePerm)
+					h.AssertNil(t, err)
+
+					err = os.WriteFile(filepath.Join(metaBuildpackFolder, "buildpack.toml"), []byte(`
+api = "0.2"
+
+[buildpack]
+  id = "local/meta-bp"
+  version = "local-meta-bp-version"
+  name = "Local Meta-Buildpack"
+
+[[order]]
+[[order.group]]
+id = "local/meta-bp-dep"
+version = "local-meta-bp-version"
+					`), 0644)
+					h.AssertNil(t, err)
+
+					err = os.WriteFile(filepath.Join(metaBuildpackFolder, "package.toml"), []byte(`
+[buildpack]
+uri = "."
+
+[[dependencies]]
+uri = "../meta-buildpack-dependency"
+					`), 0644)
+					h.AssertNil(t, err)
+
+					metaBuildpackDependencyFolder := filepath.Join(tmpDir, "meta-buildpack-dependency")
+					err = os.Mkdir(metaBuildpackDependencyFolder, os.ModePerm)
+					h.AssertNil(t, err)
+
+					err = os.WriteFile(filepath.Join(metaBuildpackDependencyFolder, "buildpack.toml"), []byte(`
+api = "0.2"
+
+[buildpack]
+  id = "local/meta-bp-dep"
+  version = "local-meta-bp-version"
+  name = "Local Meta-Buildpack Dependency"
+
+[[stacks]]
+  id = "*"
+					`), 0644)
+					h.AssertNil(t, err)
+
+					err = subject.Build(context.TODO(), BuildOptions{
+						Image:      "some/app",
+						Builder:    defaultBuilderName,
+						ClearCache: true,
+						Buildpacks: []string{metaBuildpackFolder},
+					})
+
+					h.AssertNil(t, err)
+					h.AssertEq(t, fakeLifecycle.Opts.Builder.Name(), defaultBuilderImage.Name())
+
+					bldr, err := builder.FromImage(defaultBuilderImage)
+					h.AssertNil(t, err)
+
+					buildpack1Info := dist.ModuleInfo{ID: "buildpack.1.id", Version: "buildpack.1.version"}
+					buildpack2Info := dist.ModuleInfo{ID: "buildpack.2.id", Version: "buildpack.2.version"}
+					metaBuildpackInfo := dist.ModuleInfo{ID: "local/meta-bp", Version: "local-meta-bp-version", Name: "Local Meta-Buildpack"}
+					metaBuildpackDependencyInfo := dist.ModuleInfo{ID: "local/meta-bp-dep", Version: "local-meta-bp-version", Name: "Local Meta-Buildpack Dependency"}
+					h.AssertEq(t, bldr.Buildpacks(), []dist.ModuleInfo{
+						buildpack1Info,
+						buildpack2Info,
+						metaBuildpackInfo,
+						metaBuildpackDependencyInfo,
+					})
+				})
+
+				it("fails if buildpack dependency could not be fetched", func() {
+					metaBuildpackFolder := filepath.Join(tmpDir, "meta-buildpack")
+					err := os.Mkdir(metaBuildpackFolder, os.ModePerm)
+					h.AssertNil(t, err)
+
+					err = os.WriteFile(filepath.Join(metaBuildpackFolder, "buildpack.toml"), []byte(`
+api = "0.2"
+
+[buildpack]
+  id = "local/meta-bp"
+  version = "local-meta-bp-version"
+  name = "Local Meta-Buildpack"
+
+[[order]]
+[[order.group]]
+id = "local/meta-bp-dep"
+version = "local-meta-bp-version"
+					`), 0644)
+					h.AssertNil(t, err)
+
+					err = os.WriteFile(filepath.Join(metaBuildpackFolder, "package.toml"), []byte(`
+[buildpack]
+uri = "."
+
+[[dependencies]]
+uri = "../meta-buildpack-dependency"
+
+[[dependencies]]
+uri = "../not-a-valid-dependency"
+					`), 0644)
+					h.AssertNil(t, err)
+
+					metaBuildpackDependencyFolder := filepath.Join(tmpDir, "meta-buildpack-dependency")
+					err = os.Mkdir(metaBuildpackDependencyFolder, os.ModePerm)
+					h.AssertNil(t, err)
+
+					err = os.WriteFile(filepath.Join(metaBuildpackDependencyFolder, "buildpack.toml"), []byte(`
+api = "0.2"
+
+[buildpack]
+  id = "local/meta-bp-dep"
+  version = "local-meta-bp-version"
+  name = "Local Meta-Buildpack Dependency"
+
+[[stacks]]
+  id = "*"
+					`), 0644)
+					h.AssertNil(t, err)
+
+					err = subject.Build(context.TODO(), BuildOptions{
+						Image:      "some/app",
+						Builder:    defaultBuilderName,
+						ClearCache: true,
+						Buildpacks: []string{metaBuildpackFolder},
+					})
+					h.AssertError(t, err, fmt.Sprintf("fetching package.toml dependencies (path='%s')", filepath.Join(metaBuildpackFolder, "package.toml")))
+					h.AssertError(t, err, "fetching dependencies (uri='../not-a-valid-dependency',image='')")
+				})
+			})
+
 			when("buildpackage image is used", func() {
 				var fakePackage *fakes.Image
 
 				it.Before(func() {
-					metaBuildpackTar := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
-						WithAPI: api.MustParse("0.3"),
-						WithInfo: dist.ModuleInfo{
-							ID:       "meta.buildpack.id",
-							Version:  "meta.buildpack.version",
-							Homepage: "http://meta.buildpack",
-						},
-						WithStacks: nil,
-						WithOrder: dist.Order{{
-							Group: []dist.ModuleRef{{
-								ModuleInfo: dist.ModuleInfo{
-									ID:      "child.buildpack.id",
-									Version: "child.buildpack.version",
-								},
-								Optional: false,
-							}},
-						}},
-					})
-
-					childBuildpackTar := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
-						WithAPI: api.MustParse("0.3"),
-						WithInfo: dist.ModuleInfo{
-							ID:       "child.buildpack.id",
-							Version:  "child.buildpack.version",
-							Homepage: "http://child.buildpack",
-						},
-						WithStacks: []dist.Stack{
-							{ID: defaultBuilderStackID},
-						},
-					})
-
-					bpLayers := dist.ModuleLayers{
-						"meta.buildpack.id": {
-							"meta.buildpack.version": {
-								API: api.MustParse("0.3"),
-								Order: dist.Order{{
-									Group: []dist.ModuleRef{{
-										ModuleInfo: dist.ModuleInfo{
-											ID:      "child.buildpack.id",
-											Version: "child.buildpack.version",
-										},
-										Optional: false,
-									}},
-								}},
-								LayerDiffID: diffIDForFile(t, metaBuildpackTar),
-							},
-						},
-						"child.buildpack.id": {
-							"child.buildpack.version": {
-								API: api.MustParse("0.3"),
-								Stacks: []dist.Stack{
-									{ID: defaultBuilderStackID},
-								},
-								LayerDiffID: diffIDForFile(t, childBuildpackTar),
-							},
-						},
-					}
-
-					md := buildpack.Metadata{
-						ModuleInfo: dist.ModuleInfo{
-							ID:      "meta.buildpack.id",
-							Version: "meta.buildpack.version",
-						},
-						Stacks: []dist.Stack{
-							{ID: defaultBuilderStackID},
-						},
-					}
-
-					fakePackage = fakes.NewImage("example.com/some/package", "", nil)
-					h.AssertNil(t, dist.SetLabel(fakePackage, "io.buildpacks.buildpack.layers", bpLayers))
-					h.AssertNil(t, dist.SetLabel(fakePackage, "io.buildpacks.buildpackage.metadata", md))
-
-					h.AssertNil(t, fakePackage.AddLayer(metaBuildpackTar))
-					h.AssertNil(t, fakePackage.AddLayer(childBuildpackTar))
-
+					fakePackage = makeFakePackage(t, tmpDir, defaultBuilderStackID)
 					fakeImageFetcher.LocalImages[fakePackage.Name()] = fakePackage
 				})
 
@@ -1110,6 +1176,8 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 							Version: "child.buildpack.version",
 						},
 					})
+					args := fakeImageFetcher.FetchCalls[fakePackage.Name()]
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
 				})
 
 				it("fails when no metadata label on package", func() {
@@ -1152,6 +1220,29 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 				}),
 					"downloading buildpack: error reading missing.bp@version: invalid locator: InvalidLocator",
 				)
+			})
+
+			when("from project descriptor", func() {
+				when("id - no version is provided", func() {
+					it("resolves version", func() {
+						h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+							Image:      "some/app",
+							Builder:    defaultBuilderName,
+							ClearCache: true,
+							ProjectDescriptor: projectTypes.Descriptor{
+								Build: projectTypes.Build{Buildpacks: []projectTypes.Buildpack{{ID: "buildpack.1.id"}}},
+							},
+						}))
+						h.AssertEq(t, fakeLifecycle.Opts.Builder.Name(), defaultBuilderImage.Name())
+
+						assertOrderEquals(`[[order]]
+
+  [[order.group]]
+    id = "buildpack.1.id"
+    version = "buildpack.1.version"
+`)
+					})
+				})
 			})
 
 			when("buildpacks include URIs", func() {
@@ -1275,6 +1366,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 							{ID: "some-other-buildpack-id", Version: "some-other-buildpack-version"},
 						})
 					})
+
 					it("adds the pre buildpack from the project descriptor", func() {
 						err := subject.Build(context.TODO(), BuildOptions{
 							Image:      "some/app",
@@ -1389,6 +1481,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 							{ID: "buildpack.2.id", Version: "buildpack.2.version"},
 						})
 					})
+
 					it("not added from the project descriptor", func() {
 						err := subject.Build(context.TODO(), BuildOptions{
 							Image:      "some/app",
@@ -1431,16 +1524,32 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 						h.AssertNil(t, fakeDefaultRunImage.SetLabel("io.buildpacks.stack.mixins", `["mixinX", "run:mixinZ"]`))
 					})
 
-					it("returns an error", func() {
-						err := subject.Build(context.TODO(), BuildOptions{
+					it("succeeds", func() {
+						h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
 							Image:   "some/app",
 							Builder: defaultBuilderName,
 							Buildpacks: []string{
 								buildpackTgz, // requires mixinA, build:mixinB, run:mixinC
 							},
+						}))
+					})
+
+					when("platform API < 0.12", func() {
+						it.Before(func() {
+							setAPIs(t, defaultBuilderImage, []string{"0.8"}, []string{"0.11"})
 						})
 
-						h.AssertError(t, err, "validating stack mixins: buildpack 'some-other-buildpack-id@some-other-buildpack-version' requires missing mixin(s): build:mixinB, mixinA, run:mixinC")
+						it("returns an error", func() {
+							err := subject.Build(context.TODO(), BuildOptions{
+								Image:   "some/app",
+								Builder: defaultBuilderName,
+								Buildpacks: []string{
+									buildpackTgz, // requires mixinA, build:mixinB, run:mixinC
+								},
+							})
+
+							h.AssertError(t, err, "validating stack mixins: buildpack 'some-other-buildpack-id@some-other-buildpack-version' requires missing mixin(s): build:mixinB, mixinA, run:mixinC")
+						})
 					})
 				})
 
@@ -1570,7 +1679,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 							ProjectDescriptorBaseDir: tmpDir,
 						})
 
-						h.AssertEq(t, "Invalid buildpack defined in project descriptor", err.Error())
+						h.AssertEq(t, "Invalid buildpack definition", err.Error())
 					})
 
 					it("ignores script if there is a URI", func() {
@@ -1727,7 +1836,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 
 			it("builder order-extensions is overwritten", func() {
 				additionalEx := ifakes.CreateExtensionTar(t, tmpDir, dist.ExtensionDescriptor{
-					WithAPI: api.MustParse("0.3"),
+					WithAPI: api.MustParse("0.7"),
 					WithInfo: dist.ModuleInfo{
 						ID:      "extension.add.1.id",
 						Version: "extension.add.1.version",
@@ -1851,7 +1960,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 
 						h.AssertNil(t, err)
 						h.AssertNotNil(t, fakeLifecycle.Opts.ProjectMetadata.Source)
-						h.AssertEq(t, fakeLifecycle.Opts.ProjectMetadata.Source, &platform.ProjectSource{
+						h.AssertEq(t, fakeLifecycle.Opts.ProjectMetadata.Source, &files.ProjectSource{
 							Type:     "project",
 							Version:  map[string]interface{}{"declared": "1.2.3"},
 							Metadata: map[string]interface{}{"url": "https://example.com"},
@@ -1914,16 +2023,19 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 					}))
 					h.AssertEq(t, fakeLifecycle.Opts.Publish, true)
 
-					args := fakeImageFetcher.FetchCalls["default/run"]
-					h.AssertEq(t, args.Daemon, false)
-
-					args = fakeImageFetcher.FetchCalls[defaultBuilderName]
+					args := fakeImageFetcher.FetchCalls[defaultBuilderName]
 					h.AssertEq(t, args.Daemon, true)
+
+					args = fakeImageFetcher.FetchCalls["default/run"]
+					h.AssertEq(t, args.Daemon, false)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
 				})
 
 				when("builder is untrusted", func() {
 					when("lifecycle image is available", func() {
 						it("uses the 5 phases with the lifecycle image", func() {
+							origLifecyleName := fakeLifecycleImage.Name()
+
 							h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
 								Image:        "some/app",
 								Builder:      defaultBuilderName,
@@ -1931,18 +2043,15 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 								TrustBuilder: func(string) bool { return false },
 							}))
 							h.AssertEq(t, fakeLifecycle.Opts.UseCreator, false)
-							h.AssertEq(t, fakeLifecycle.Opts.LifecycleImage, fakeLifecycleImage.Name())
-
-							args := fakeImageFetcher.FetchCalls[fakeLifecycleImage.Name()]
+							h.AssertContains(t, fakeLifecycle.Opts.LifecycleImage, "pack.local/lifecycle")
+							args := fakeImageFetcher.FetchCalls[origLifecyleName]
+							h.AssertNotNil(t, args)
 							h.AssertEq(t, args.Daemon, true)
 							h.AssertEq(t, args.PullPolicy, image.PullAlways)
-							h.AssertEq(t, args.Platform, "linux/amd64")
-						})
-						it("uses the api versions of the lifecycle image", func() {
-							h.AssertTrue(t, true)
+							h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
 						})
 						it("parses the versions correctly", func() {
-							fakeLifecycleImage.SetLabel("io.buildpacks.lifecycle.apis", "{\"platform\":{\"deprecated\":[\"0.1\"],\"supported\":[\"0.2\",\"0.3\",\"0.4\",\"0.5\"]}}")
+							fakeLifecycleImage.SetLabel("io.buildpacks.lifecycle.apis", "{\"platform\":{\"deprecated\":[\"0.1\",\"0.2\",\"0.3\",\"0.4\",\"0.5\",\"0.6\"],\"supported\":[\"0.7\",\"0.8\",\"0.9\",\"0.10\",\"0.11\",\"0.12\"]}}")
 
 							h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
 								Image:        "some/app",
@@ -1950,7 +2059,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 								Publish:      true,
 								TrustBuilder: func(string) bool { return false },
 							}))
-							h.AssertSliceContainsInOrder(t, fakeLifecycle.Opts.LifecycleApis, "0.1", "0.2", "0.3", "0.4", "0.5")
+							h.AssertSliceContainsInOrder(t, fakeLifecycle.Opts.LifecycleApis, "0.1", "0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.8", "0.9", "0.10", "0.11", "0.12")
 						})
 					})
 
@@ -1979,6 +2088,109 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 
 							args := fakeImageFetcher.FetchCalls[fakeLifecycleImage.Name()]
 							h.AssertNil(t, args)
+						})
+
+						when("additional buildpacks were added", func() {
+							it("uses creator when additional buildpacks are provided and TrustExtraBuildpacks is set", func() {
+								additionalBP := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
+									WithAPI: api.MustParse("0.3"),
+									WithInfo: dist.ModuleInfo{
+										ID:      "buildpack.add.1.id",
+										Version: "buildpack.add.1.version",
+									},
+									WithStacks: []dist.Stack{{ID: defaultBuilderStackID}},
+									WithOrder:  nil,
+								})
+
+								h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+									Image:                "some/app",
+									Builder:              defaultBuilderName,
+									Publish:              true,
+									TrustBuilder:         func(string) bool { return true },
+									TrustExtraBuildpacks: true,
+									Buildpacks:           []string{additionalBP},
+								}))
+								h.AssertEq(t, fakeLifecycle.Opts.UseCreator, true)
+							})
+
+							it("uses the 5 phases with the lifecycle image", func() {
+								additionalBP := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
+									WithAPI: api.MustParse("0.3"),
+									WithInfo: dist.ModuleInfo{
+										ID:      "buildpack.add.1.id",
+										Version: "buildpack.add.1.version",
+									},
+									WithStacks: []dist.Stack{{ID: defaultBuilderStackID}},
+									WithOrder:  nil,
+								})
+
+								h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+									Image:        "some/app",
+									Builder:      defaultBuilderName,
+									Publish:      true,
+									TrustBuilder: func(string) bool { return true },
+									Buildpacks:   []string{additionalBP},
+								}))
+								h.AssertEq(t, fakeLifecycle.Opts.UseCreator, false)
+								h.AssertEq(t, fakeLifecycle.Opts.LifecycleImage, fakeLifecycleImage.Name())
+
+								h.AssertContains(t, outBuf.String(), "Builder is trusted but additional modules were added; using the untrusted (5 phases) build flow")
+							})
+
+							when("from project descriptor", func() {
+								it("uses the 5 phases with the lifecycle image", func() {
+									additionalBP := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
+										WithAPI: api.MustParse("0.3"),
+										WithInfo: dist.ModuleInfo{
+											ID:      "buildpack.add.1.id",
+											Version: "buildpack.add.1.version",
+										},
+										WithStacks: []dist.Stack{{ID: defaultBuilderStackID}},
+										WithOrder:  nil,
+									})
+
+									h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+										Image:        "some/app",
+										Builder:      defaultBuilderName,
+										Publish:      true,
+										TrustBuilder: func(string) bool { return true },
+										ProjectDescriptor: projectTypes.Descriptor{Build: projectTypes.Build{
+											Buildpacks: []projectTypes.Buildpack{{
+												URI: additionalBP,
+											}},
+										}},
+									}))
+									h.AssertEq(t, fakeLifecycle.Opts.UseCreator, false)
+									h.AssertEq(t, fakeLifecycle.Opts.LifecycleImage, fakeLifecycleImage.Name())
+
+									h.AssertContains(t, outBuf.String(), "Builder is trusted but additional modules were added; using the untrusted (5 phases) build flow")
+								})
+
+								when("inline buildpack", func() {
+									it("uses the creator with the provided builder", func() {
+										h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+											Image:        "some/app",
+											Builder:      defaultBuilderName,
+											Publish:      true,
+											TrustBuilder: func(string) bool { return true },
+											ProjectDescriptor: projectTypes.Descriptor{Build: projectTypes.Build{
+												Buildpacks: []projectTypes.Buildpack{{
+													ID:      "buildpack.add.1.id",
+													Version: "buildpack.add.1.version",
+													Script: projectTypes.Script{
+														API:    "0.10",
+														Inline: "echo hello",
+													},
+												}},
+											}},
+										}))
+										h.AssertEq(t, fakeLifecycle.Opts.UseCreator, true)
+
+										args := fakeImageFetcher.FetchCalls[fakeLifecycleImage.Name()]
+										h.AssertNil(t, args)
+									})
+								})
+							})
 						})
 					})
 
@@ -2022,6 +2234,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 				when("builder is untrusted", func() {
 					when("lifecycle image is available", func() {
 						it("uses the 5 phases with the lifecycle image", func() {
+							origLifecyleName := fakeLifecycleImage.Name()
 							h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
 								Image:        "some/app",
 								Builder:      defaultBuilderName,
@@ -2029,24 +2242,12 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 								TrustBuilder: func(string) bool { return false },
 							}))
 							h.AssertEq(t, fakeLifecycle.Opts.UseCreator, false)
-							h.AssertEq(t, fakeLifecycle.Opts.LifecycleImage, fakeLifecycleImage.Name())
-
-							args := fakeImageFetcher.FetchCalls[fakeLifecycleImage.Name()]
+							h.AssertContains(t, fakeLifecycle.Opts.LifecycleImage, "pack.local/lifecycle")
+							args := fakeImageFetcher.FetchCalls[origLifecyleName]
+							h.AssertNotNil(t, args)
 							h.AssertEq(t, args.Daemon, true)
 							h.AssertEq(t, args.PullPolicy, image.PullAlways)
-							h.AssertEq(t, args.Platform, "linux/amd64")
-						})
-
-						it("suggests that being untrusted may be the root of a failure", func() {
-							subject.lifecycleExecutor = &executeFailsLifecycle{}
-							err := subject.Build(context.TODO(), BuildOptions{
-								Image:        "some/app",
-								Builder:      defaultBuilderName,
-								Publish:      false,
-								TrustBuilder: func(string) bool { return false },
-							})
-
-							h.AssertError(t, err, "may be the result of using an untrusted builder")
+							h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
 						})
 					})
 
@@ -2098,6 +2299,84 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 			})
 		})
 
+		when("Platform option", func() {
+			var fakePackage imgutil.Image
+
+			it.Before(func() {
+				fakePackage = makeFakePackage(t, tmpDir, defaultBuilderStackID)
+				fakeImageFetcher.LocalImages[fakePackage.Name()] = fakePackage
+			})
+
+			when("provided", func() {
+				it("uses the provided platform to pull the builder, run image, packages, and lifecycle image", func() {
+					h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+						Image:   "some/app",
+						Builder: defaultBuilderName,
+						Buildpacks: []string{
+							"example.com/some/package",
+						},
+						Platform:   "linux/arm64",
+						PullPolicy: image.PullAlways,
+					}))
+
+					args := fakeImageFetcher.FetchCalls[defaultBuilderName]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/arm64")
+
+					args = fakeImageFetcher.FetchCalls["default/run"]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/arm64")
+
+					args = fakeImageFetcher.FetchCalls[fakePackage.Name()]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/arm64")
+
+					args = fakeImageFetcher.FetchCalls[fmt.Sprintf("%s:%s", cfg.DefaultLifecycleImageRepo, builder.DefaultLifecycleVersion)]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/arm64")
+				})
+			})
+
+			when("not provided", func() {
+				it("defaults to builder os/arch", func() {
+					// defaultBuilderImage has linux/amd64
+
+					h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+						Image:   "some/app",
+						Builder: defaultBuilderName,
+						Buildpacks: []string{
+							"example.com/some/package",
+						},
+						PullPolicy: image.PullAlways,
+					}))
+
+					args := fakeImageFetcher.FetchCalls[defaultBuilderName]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target, (*dist.Target)(nil))
+
+					args = fakeImageFetcher.FetchCalls["default/run"]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
+
+					args = fakeImageFetcher.FetchCalls[fakePackage.Name()]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
+
+					args = fakeImageFetcher.FetchCalls[fmt.Sprintf("%s:%s", cfg.DefaultLifecycleImageRepo, builder.DefaultLifecycleVersion)]
+					h.AssertEq(t, args.Daemon, true)
+					h.AssertEq(t, args.PullPolicy, image.PullAlways)
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
+				})
+			})
+		})
+
 		when("PullPolicy", func() {
 			when("never", func() {
 				it("uses the local builder and run images without updating", func() {
@@ -2118,7 +2397,39 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 					args = fakeImageFetcher.FetchCalls[fmt.Sprintf("%s:%s", cfg.DefaultLifecycleImageRepo, builder.DefaultLifecycleVersion)]
 					h.AssertEq(t, args.Daemon, true)
 					h.AssertEq(t, args.PullPolicy, image.PullNever)
-					h.AssertEq(t, args.Platform, "linux/amd64")
+					h.AssertEq(t, args.Target.ValuesAsPlatform(), "linux/amd64")
+				})
+			})
+
+			when("containerized pack", func() {
+				it.Before(func() {
+					RunningInContainer = func() bool {
+						return true
+					}
+				})
+
+				when("--pull-policy=always", func() {
+					it("does not warn", func() {
+						h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+							Image:      "some/app",
+							Builder:    defaultBuilderName,
+							PullPolicy: image.PullAlways,
+						}))
+
+						h.AssertNotContains(t, outBuf.String(), "failing to pull build inputs from a remote registry is insecure")
+					})
+				})
+
+				when("not --pull-policy=always", func() {
+					it("warns", func() {
+						h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+							Image:      "some/app",
+							Builder:    defaultBuilderName,
+							PullPolicy: image.PullNever,
+						}))
+
+						h.AssertContains(t, outBuf.String(), "failing to pull build inputs from a remote registry is insecure")
+					})
 				})
 			})
 
@@ -2449,6 +2760,40 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 					})
 				})
 			})
+
+			when("use creator with extensions", func() {
+				when("lifecycle is old", func() {
+					it("false", func() {
+						oldLifecycleBuilder := newFakeBuilderImage(t, tmpDir, "example.com/old-lifecycle-builder:tag", defaultBuilderStackID, defaultRunImageName, "0.18.0", newLinuxImage)
+						defer oldLifecycleBuilder.Cleanup()
+						fakeImageFetcher.LocalImages[oldLifecycleBuilder.Name()] = oldLifecycleBuilder
+
+						h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+							Image:        "some/app",
+							Builder:      oldLifecycleBuilder.Name(),
+							TrustBuilder: func(string) bool { return true },
+						}))
+
+						h.AssertEq(t, fakeLifecycle.Opts.UseCreatorWithExtensions, false)
+					})
+				})
+
+				when("lifecycle is new", func() {
+					it("true", func() {
+						newLifecycleBuilder := newFakeBuilderImage(t, tmpDir, "example.com/new-lifecycle-builder:tag", defaultBuilderStackID, defaultRunImageName, "0.19.0", newLinuxImage)
+						defer newLifecycleBuilder.Cleanup()
+						fakeImageFetcher.LocalImages[newLifecycleBuilder.Name()] = newLifecycleBuilder
+
+						h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
+							Image:        "some/app",
+							Builder:      newLifecycleBuilder.Name(),
+							TrustBuilder: func(string) bool { return true },
+						}))
+
+						h.AssertEq(t, fakeLifecycle.Opts.UseCreatorWithExtensions, true)
+					})
+				})
+			})
 		})
 
 		when("validating mixins", func() {
@@ -2458,13 +2803,26 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 					h.AssertNil(t, fakeDefaultRunImage.SetLabel("io.buildpacks.stack.mixins", `["mixinB"]`))
 				})
 
-				it("returns an error", func() {
-					err := subject.Build(context.TODO(), BuildOptions{
+				it("succeeds", func() {
+					h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
 						Image:   "some/app",
 						Builder: defaultBuilderName,
+					}))
+				})
+
+				when("platform API < 0.12", func() {
+					it.Before(func() {
+						setAPIs(t, defaultBuilderImage, []string{"0.8"}, []string{"0.11"})
 					})
 
-					h.AssertError(t, err, "validating stack mixins: 'default/run' missing required mixin(s): mixinA")
+					it("returns an error", func() {
+						err := subject.Build(context.TODO(), BuildOptions{
+							Image:   "some/app",
+							Builder: defaultBuilderName,
+						})
+
+						h.AssertError(t, err, "validating stack mixins: 'default/run' missing required mixin(s): mixinA")
+					})
 				})
 			})
 
@@ -2474,13 +2832,26 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 					h.AssertNil(t, fakeDefaultRunImage.SetLabel("io.buildpacks.stack.mixins", ""))
 				})
 
-				it("returns an error", func() {
-					err := subject.Build(context.TODO(), BuildOptions{
+				it("succeeds", func() {
+					h.AssertNil(t, subject.Build(context.TODO(), BuildOptions{
 						Image:   "some/app",
 						Builder: defaultBuilderName,
+					}))
+				})
+
+				when("platform API < 0.12", func() {
+					it.Before(func() {
+						setAPIs(t, defaultBuilderImage, []string{"0.8"}, []string{"0.11"})
 					})
 
-					h.AssertError(t, err, "validating stack mixins: buildpack 'buildpack.1.id@buildpack.1.version' requires missing mixin(s): build:mixinY, mixinX, run:mixinZ")
+					it("returns an error", func() {
+						err := subject.Build(context.TODO(), BuildOptions{
+							Image:   "some/app",
+							Builder: defaultBuilderName,
+						})
+
+						h.AssertError(t, err, "validating stack mixins: buildpack 'buildpack.1.id@buildpack.1.version' requires missing mixin(s): build:mixinY, mixinX, run:mixinZ")
+					})
 				})
 			})
 		})
@@ -2538,7 +2909,11 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 								Volumes: []string{":::"},
 							},
 						})
-						h.AssertError(t, err, `platform volume ":::" has invalid format: invalid volume specification: ':::'`)
+						if runtime.GOOS == "darwin" {
+							h.AssertError(t, err, `platform volume ":::" has invalid format: invalid spec: :::: empty section between colons`)
+						} else {
+							h.AssertError(t, err, `platform volume ":::" has invalid format: invalid volume specification: ':::'`)
+						}
 					})
 				})
 
@@ -2550,6 +2925,8 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 						"/cnb/nested",
 						"/layers",
 						"/layers/nested",
+						"/workspace",
+						"/workspace/bindings",
 					} {
 						p := p
 						it(fmt.Sprintf("warns when mounting to '%s'", p), func() {
@@ -2622,7 +2999,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 
 					when("mounting onto cnb spec'd dir", func() {
 						for _, p := range []string{
-							`/cnb`, `/cnb/buildpacks`, `/layers`,
+							`/cnb`, `/cnb/buildpacks`, `/layers`, `/workspace`,
 						} {
 							p := p
 							it(fmt.Sprintf("warns when mounting to '%s'", p), func() {
@@ -2692,7 +3069,7 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 
 					when("mounting onto cnb spec'd dir", func() {
 						for _, p := range []string{
-							`c:\cnb`, `c:\cnb\buildpacks`, `c:\layers`,
+							`c:\cnb`, `c:\cnb\buildpacks`, `c:\layers`, `c:\workspace`,
 						} {
 							p := p
 							it(fmt.Sprintf("warns when mounting to '%s'", p), func() {
@@ -2788,40 +3165,19 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 		when("there are extensions", func() {
 			withExtensionsLabel = true
 
-			when("experimental", func() {
-				when("false", func() {
-					it("errors", func() {
-						err := subject.Build(context.TODO(), BuildOptions{
-							Image:   "some/app",
-							Builder: defaultBuilderName,
-						})
-
-						h.AssertNotNil(t, err)
-					})
-				})
-
-				when("true", func() {
-					it.Before(func() {
-						subject.experimental = true
+			when("default configuration", func() {
+				it("succeeds", func() {
+					err := subject.Build(context.TODO(), BuildOptions{
+						Image:   "some/app",
+						Builder: defaultBuilderName,
 					})
 
-					it("succeeds", func() {
-						err := subject.Build(context.TODO(), BuildOptions{
-							Image:   "some/app",
-							Builder: defaultBuilderName,
-						})
-
-						h.AssertNil(t, err)
-						h.AssertEq(t, fakeLifecycle.Opts.BuilderImage, defaultBuilderName)
-					})
+					h.AssertNil(t, err)
+					h.AssertEq(t, fakeLifecycle.Opts.BuilderImage, defaultBuilderName)
 				})
 			})
 
 			when("os", func() {
-				it.Before(func() {
-					subject.experimental = true
-				})
-
 				when("windows", func() {
 					it.Before(func() {
 						h.SkipIf(t, runtime.GOOS != "windows", "Skipped on non-windows")
@@ -2851,10 +3207,6 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 			})
 
 			when("pull policy", func() {
-				it.Before(func() {
-					subject.experimental = true
-				})
-
 				when("always", func() {
 					it("succeeds", func() {
 						err := subject.Build(context.TODO(), BuildOptions{
@@ -2971,6 +3323,85 @@ func testBuild(t *testing.T, when spec.G, it spec.S) {
 	})
 }
 
+func makeFakePackage(t *testing.T, tmpDir string, stackID string) *fakes.Image {
+	metaBuildpackTar := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
+		WithAPI: api.MustParse("0.3"),
+		WithInfo: dist.ModuleInfo{
+			ID:       "meta.buildpack.id",
+			Version:  "meta.buildpack.version",
+			Homepage: "http://meta.buildpack",
+		},
+		WithStacks: nil,
+		WithOrder: dist.Order{{
+			Group: []dist.ModuleRef{{
+				ModuleInfo: dist.ModuleInfo{
+					ID:      "child.buildpack.id",
+					Version: "child.buildpack.version",
+				},
+				Optional: false,
+			}},
+		}},
+	})
+
+	childBuildpackTar := ifakes.CreateBuildpackTar(t, tmpDir, dist.BuildpackDescriptor{
+		WithAPI: api.MustParse("0.3"),
+		WithInfo: dist.ModuleInfo{
+			ID:       "child.buildpack.id",
+			Version:  "child.buildpack.version",
+			Homepage: "http://child.buildpack",
+		},
+		WithStacks: []dist.Stack{
+			{ID: stackID},
+		},
+	})
+
+	bpLayers := dist.ModuleLayers{
+		"meta.buildpack.id": {
+			"meta.buildpack.version": {
+				API: api.MustParse("0.3"),
+				Order: dist.Order{{
+					Group: []dist.ModuleRef{{
+						ModuleInfo: dist.ModuleInfo{
+							ID:      "child.buildpack.id",
+							Version: "child.buildpack.version",
+						},
+						Optional: false,
+					}},
+				}},
+				LayerDiffID: diffIDForFile(t, metaBuildpackTar),
+			},
+		},
+		"child.buildpack.id": {
+			"child.buildpack.version": {
+				API: api.MustParse("0.3"),
+				Stacks: []dist.Stack{
+					{ID: stackID},
+				},
+				LayerDiffID: diffIDForFile(t, childBuildpackTar),
+			},
+		},
+	}
+
+	md := buildpack.Metadata{
+		ModuleInfo: dist.ModuleInfo{
+			ID:      "meta.buildpack.id",
+			Version: "meta.buildpack.version",
+		},
+		Stacks: []dist.Stack{
+			{ID: stackID},
+		},
+	}
+
+	fakePackage := fakes.NewImage("example.com/some/package", "", nil)
+	h.AssertNil(t, dist.SetLabel(fakePackage, "io.buildpacks.buildpack.layers", bpLayers))
+	h.AssertNil(t, dist.SetLabel(fakePackage, "io.buildpacks.buildpackage.metadata", md))
+
+	h.AssertNil(t, fakePackage.AddLayer(metaBuildpackTar))
+	h.AssertNil(t, fakePackage.AddLayer(childBuildpackTar))
+
+	return fakePackage
+}
+
 func diffIDForFile(t *testing.T, path string) string {
 	file, err := os.Open(path)
 	h.AssertNil(t, err)
@@ -2997,6 +3428,14 @@ func newWindowsImage(name, topLayerSha string, identifier imgutil.Identifier) *f
 }
 
 func newFakeBuilderImage(t *testing.T, tmpDir, builderName, defaultBuilderStackID, runImageName, lifecycleVersion string, osImageCreator ifakes.FakeImageCreator) *fakes.Image {
+	var supportedBuildpackAPIs builder.APISet
+	for _, v := range api.Buildpack.Supported {
+		supportedBuildpackAPIs = append(supportedBuildpackAPIs, v)
+	}
+	var supportedPlatformAPIs builder.APISet
+	for _, v := range api.Platform.Supported {
+		supportedPlatformAPIs = append(supportedPlatformAPIs, v)
+	}
 	return ifakes.NewFakeBuilderImage(t,
 		tmpDir,
 		builderName,
@@ -3029,10 +3468,10 @@ func newFakeBuilderImage(t *testing.T, tmpDir, builderName, defaultBuilderStackI
 				},
 				APIs: builder.LifecycleAPIs{
 					Buildpack: builder.APIVersions{
-						Supported: builder.APISet{api.MustParse("0.2"), api.MustParse("0.3"), api.MustParse("0.4")},
+						Supported: supportedBuildpackAPIs,
 					},
 					Platform: builder.APIVersions{
-						Supported: builder.APISet{api.MustParse("0.3"), api.MustParse("0.4")},
+						Supported: supportedPlatformAPIs,
 					},
 				},
 			},
@@ -3107,11 +3546,29 @@ func newFakeBuilderImage(t *testing.T, tmpDir, builderName, defaultBuilderStackI
 	)
 }
 
-type executeFailsLifecycle struct {
-	Opts build.LifecycleOptions
-}
-
-func (f *executeFailsLifecycle) Execute(_ context.Context, opts build.LifecycleOptions) error {
-	f.Opts = opts
-	return errors.New("")
+func setAPIs(t *testing.T, image *fakes.Image, buildpackAPIs []string, platformAPIs []string) {
+	builderMDLabelName := "io.buildpacks.builder.metadata"
+	var supportedBuildpackAPIs builder.APISet
+	for _, v := range buildpackAPIs {
+		supportedBuildpackAPIs = append(supportedBuildpackAPIs, api.MustParse(v))
+	}
+	var supportedPlatformAPIs builder.APISet
+	for _, v := range platformAPIs {
+		supportedPlatformAPIs = append(supportedPlatformAPIs, api.MustParse(v))
+	}
+	builderMDLabel, err := image.Label(builderMDLabelName)
+	h.AssertNil(t, err)
+	var builderMD builder.Metadata
+	h.AssertNil(t, json.Unmarshal([]byte(builderMDLabel), &builderMD))
+	builderMD.Lifecycle.APIs = builder.LifecycleAPIs{
+		Buildpack: builder.APIVersions{
+			Supported: supportedBuildpackAPIs,
+		},
+		Platform: builder.APIVersions{
+			Supported: supportedPlatformAPIs,
+		},
+	}
+	builderMDLabelBytes, err := json.Marshal(&builderMD)
+	h.AssertNil(t, err)
+	h.AssertNil(t, image.SetLabel(builderMDLabelName, string(builderMDLabelBytes)))
 }

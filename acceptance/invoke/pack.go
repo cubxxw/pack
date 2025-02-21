@@ -1,5 +1,4 @@
 //go:build acceptance
-// +build acceptance
 
 package invoke
 
@@ -194,7 +193,7 @@ func (i *PackInvoker) EnableExperimental() {
 //   - "<command>" (e.g. "create-builder")
 //   - "<flag>" (e.g. "--verbose")
 //   - "<command> <flag>" (e.g. "build --network")
-//   - "<command>... <flag>" (e.g. "config trusted-builder--network")
+//   - "<command>... <flag>" (e.g. "config trusted-builder --network")
 //
 // Any other form may return false.
 func (i *PackInvoker) Supports(command string) bool {
@@ -218,6 +217,9 @@ func (i *PackInvoker) Supports(command string) bool {
 	output, err := i.baseCmd(cmdParts...).CombinedOutput()
 	i.assert.Nil(err)
 
+	// FIXME: this doesn't appear to be working as expected,
+	// as tests against "build --creation-time" and "build --cache" are returning unsupported
+	// even on the latest version of pack.
 	return re.MatchString(string(output)) && !strings.Contains(string(output), "Unknown help topic")
 }
 
@@ -226,7 +228,19 @@ type Feature int
 const (
 	CreationTime = iota
 	Cache
-	Extensions
+	BuildImageExtensions
+	RunImageExtensions
+	StackValidation
+	ForceRebase
+	BuildpackFlatten
+	MetaBuildpackFolder
+	PlatformRetries
+	FlattenBuilderCreationV2
+	FixesRunImageMetadata
+	ManifestCommands
+	PlatformOption
+	MultiPlatformBuildersAndBuildPackages
+	StackWarning
 )
 
 var featureTests = map[Feature]func(i *PackInvoker) bool{
@@ -236,8 +250,44 @@ var featureTests = map[Feature]func(i *PackInvoker) bool{
 	Cache: func(i *PackInvoker) bool {
 		return i.Supports("build --cache")
 	},
-	Extensions: func(i *PackInvoker) bool {
+	BuildImageExtensions: func(i *PackInvoker) bool {
 		return i.laterThan("v0.27.0")
+	},
+	RunImageExtensions: func(i *PackInvoker) bool {
+		return i.laterThan("v0.29.0")
+	},
+	StackValidation: func(i *PackInvoker) bool {
+		return !i.atLeast("v0.30.0")
+	},
+	ForceRebase: func(i *PackInvoker) bool {
+		return i.atLeast("v0.30.0")
+	},
+	BuildpackFlatten: func(i *PackInvoker) bool {
+		return i.atLeast("v0.30.0")
+	},
+	MetaBuildpackFolder: func(i *PackInvoker) bool {
+		return i.atLeast("v0.30.0")
+	},
+	PlatformRetries: func(i *PackInvoker) bool {
+		return i.atLeast("v0.32.1")
+	},
+	FlattenBuilderCreationV2: func(i *PackInvoker) bool {
+		return i.atLeast("v0.33.1")
+	},
+	FixesRunImageMetadata: func(i *PackInvoker) bool {
+		return i.atLeast("v0.34.0")
+	},
+	ManifestCommands: func(i *PackInvoker) bool {
+		return i.atLeast("v0.34.0")
+	},
+	PlatformOption: func(i *PackInvoker) bool {
+		return i.atLeast("v0.34.0")
+	},
+	MultiPlatformBuildersAndBuildPackages: func(i *PackInvoker) bool {
+		return i.atLeast("v0.34.0")
+	},
+	StackWarning: func(i *PackInvoker) bool {
+		return i.atLeast("v0.37.0")
 	},
 }
 

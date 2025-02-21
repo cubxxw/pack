@@ -29,6 +29,7 @@ type Logger interface {
 
 type ImageFetcher interface {
 	Fetch(ctx context.Context, name string, options image.FetchOptions) (imgutil.Image, error)
+	CheckReadAccess(repo string, options image.FetchOptions) bool
 }
 
 type Downloader interface {
@@ -64,7 +65,7 @@ type DownloadOptions struct {
 	// The base directory to use to resolve relative assets
 	RelativeBaseDir string
 
-	// The OS of the builder image
+	// Deprecated: the older alternative to specify the OS to download; use Target instead
 	ImageOS string
 
 	// Deprecated: the older alternative to buildpack URI
@@ -76,6 +77,9 @@ type DownloadOptions struct {
 	Daemon bool
 
 	PullPolicy image.PullPolicy
+
+	// The OS/Architecture/Variant to download.
+	Target *dist.Target
 }
 
 func (c *buildpackDownloader) Download(ctx context.Context, moduleURI string, opts DownloadOptions) (BuildModule, []BuildModule, error) {
@@ -96,14 +100,17 @@ func (c *buildpackDownloader) Download(ctx context.Context, moduleURI string, op
 			return nil, nil, err
 		}
 	}
-
 	var mainBP BuildModule
 	var depBPs []BuildModule
 	switch locatorType {
 	case PackageLocator:
 		imageName := ParsePackageLocator(moduleURI)
 		c.logger.Debugf("Downloading %s from image: %s", kind, style.Symbol(imageName))
-		mainBP, depBPs, err = extractPackaged(ctx, kind, imageName, c.imageFetcher, image.FetchOptions{Daemon: opts.Daemon, PullPolicy: opts.PullPolicy})
+		mainBP, depBPs, err = extractPackaged(ctx, kind, imageName, c.imageFetcher, image.FetchOptions{
+			Daemon:     opts.Daemon,
+			PullPolicy: opts.PullPolicy,
+			Target:     opts.Target,
+		})
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "extracting from registry %s", style.Symbol(moduleURI))
 		}
@@ -114,7 +121,11 @@ func (c *buildpackDownloader) Download(ctx context.Context, moduleURI string, op
 			return nil, nil, errors.Wrapf(err, "locating in registry: %s", style.Symbol(moduleURI))
 		}
 
-		mainBP, depBPs, err = extractPackaged(ctx, kind, address, c.imageFetcher, image.FetchOptions{Daemon: opts.Daemon, PullPolicy: opts.PullPolicy})
+		mainBP, depBPs, err = extractPackaged(ctx, kind, address, c.imageFetcher, image.FetchOptions{
+			Daemon:     opts.Daemon,
+			PullPolicy: opts.PullPolicy,
+			Target:     opts.Target,
+		})
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "extracting from registry %s", style.Symbol(moduleURI))
 		}
@@ -131,7 +142,11 @@ func (c *buildpackDownloader) Download(ctx context.Context, moduleURI string, op
 			return nil, nil, errors.Wrapf(err, "downloading %s from %s", kind, style.Symbol(moduleURI))
 		}
 
-		mainBP, depBPs, err = decomposeBlob(blob, kind, opts.ImageOS)
+		imageOS := opts.ImageOS
+		if opts.Target != nil {
+			imageOS = opts.Target.OS
+		}
+		mainBP, depBPs, err = decomposeBlob(blob, kind, imageOS, c.logger)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "extracting from %s", style.Symbol(moduleURI))
 		}
@@ -143,7 +158,7 @@ func (c *buildpackDownloader) Download(ctx context.Context, moduleURI string, op
 
 // decomposeBlob decomposes a buildpack or extension blob into the main module (order buildpack or extension) and
 // (for buildpack blobs) its dependent buildpacks.
-func decomposeBlob(blob blob.Blob, kind string, imageOS string) (mainModule BuildModule, depModules []BuildModule, err error) {
+func decomposeBlob(blob blob.Blob, kind string, imageOS string, logger Logger) (mainModule BuildModule, depModules []BuildModule, err error) {
 	isOCILayout, err := IsOCILayoutBlob(blob)
 	if err != nil {
 		return mainModule, depModules, errors.Wrapf(err, "inspecting %s blob", kind)
@@ -161,9 +176,9 @@ func decomposeBlob(blob blob.Blob, kind string, imageOS string) (mainModule Buil
 		}
 
 		if kind == KindExtension {
-			mainModule, err = FromExtensionRootBlob(blob, layerWriterFactory)
+			mainModule, err = FromExtensionRootBlob(blob, layerWriterFactory, logger)
 		} else {
-			mainModule, err = FromBuildpackRootBlob(blob, layerWriterFactory)
+			mainModule, err = FromBuildpackRootBlob(blob, layerWriterFactory, logger)
 		}
 		if err != nil {
 			return mainModule, depModules, errors.Wrapf(err, "reading %s", kind)
@@ -198,13 +213,12 @@ func extractPackaged(ctx context.Context, kind string, pkgImageRef string, fetch
 	case KindBuildpack:
 		mainModule, depModules, err = extractBuildpacks(pkgImage)
 	case KindExtension:
-		return nil, nil, nil // TODO: add extractExtensions when `pack extension package` is supported in https://github.com/buildpacks/pack/issues/1489
+		mainModule, err = extractExtensions(pkgImage)
 	default:
 		return nil, nil, fmt.Errorf("unknown module kind: %s", kind)
 	}
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "extracting %ss from %s", kind, style.Symbol(pkgImageRef))
 	}
-
 	return mainModule, depModules, nil
 }

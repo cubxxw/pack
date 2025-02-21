@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,18 +15,20 @@ import (
 	"github.com/apex/log"
 	ifakes "github.com/buildpacks/imgutil/fakes"
 	"github.com/buildpacks/lifecycle/api"
+	"github.com/buildpacks/lifecycle/platform/files"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/heroku/color"
 	"github.com/sclevine/spec"
 	"github.com/sclevine/spec/report"
 
-	"github.com/buildpacks/pack/internal/paths"
-
 	"github.com/buildpacks/pack/internal/build"
 	"github.com/buildpacks/pack/internal/build/fakes"
-	"github.com/buildpacks/pack/internal/cache"
+	"github.com/buildpacks/pack/internal/paths"
+	"github.com/buildpacks/pack/pkg/cache"
 	"github.com/buildpacks/pack/pkg/dist"
 	"github.com/buildpacks/pack/pkg/logging"
 	h "github.com/buildpacks/pack/testhelpers"
@@ -35,8 +36,6 @@ import (
 
 // TestLifecycleExecution are unit tests that test each possible phase to ensure they are executed with the proper parameters
 func TestLifecycleExecution(t *testing.T) {
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	color.Disable(true)
 	defer color.Disable(false)
 
@@ -71,11 +70,16 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 		lifecycle        *build.LifecycleExecution
 		fakeBuildCache   = newFakeVolumeCache()
 		fakeLaunchCache  *fakes.FakeCache
+		fakeKanikoCache  *fakes.FakeCache
 		fakePhase        *fakes.FakePhase
 		fakePhaseFactory *fakes.FakePhaseFactory
+		fakeFetcher      fakeImageFetcher
 		configProvider   *build.PhaseConfigProvider
 
 		extensionsForBuild, extensionsForRun bool
+		extensionsRunImageName               string
+		extensionsRunImageIdentifier         string
+		useCreatorWithExtensions             bool
 	)
 
 	var configureDefaultTestLifecycle = func(opts *build.LifecycleOptions) {
@@ -89,6 +93,8 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 		opts.UseCreator = providedUseCreator
 		opts.Volumes = providedVolumes
 		opts.Layout = providedLayout
+		opts.Keychain = authn.DefaultKeychain
+		opts.UseCreatorWithExtensions = useCreatorWithExtensions
 
 		targetImageRef, err := name.ParseReference(providedTargetImage)
 		h.AssertNil(t, err)
@@ -117,41 +123,56 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			fakes.WithImage(image),
 		)
 		h.AssertNil(t, err)
-		lifecycleOps = append(lifecycleOps, fakes.WithBuilder(fakeBuilder))
+		fakeFetcher = fakeImageFetcher{
+			callCount:           0,
+			calledWithArgAtCall: make(map[int]string),
+		}
+		withFakeFetchRunImageFunc := func(opts *build.LifecycleOptions) {
+			opts.FetchRunImageWithLifecycleLayer = newFakeFetchRunImageFunc(&fakeFetcher)
+		}
+		lifecycleOps = append(lifecycleOps, fakes.WithBuilder(fakeBuilder), withFakeFetchRunImageFunc)
 
 		tmpDir, err = os.MkdirTemp("", "pack.unit")
 		h.AssertNil(t, err)
-
 		lifecycle = newTestLifecycleExec(t, true, tmpDir, lifecycleOps...)
 
-		// set working directory to be a directory that we control so that we can put fixtures into it
-		if extensionsForBuild || extensionsForRun {
-			if extensionsForBuild {
-				// the directory is <layers>/generated/build inside the build container, but `CopyOutTo` only copies the directory
-				err = os.MkdirAll(filepath.Join(tmpDir, "build"), 0755)
+		// construct fixtures for extensions
+		if extensionsForBuild {
+			if platformAPI.LessThan("0.13") {
+				err = os.MkdirAll(filepath.Join(tmpDir, "generated", "build", "some-buildpack-id"), 0755)
 				h.AssertNil(t, err)
-				_, err = os.Create(filepath.Join(tmpDir, "build", "some-dockerfile"))
+			} else {
+				err = os.MkdirAll(filepath.Join(tmpDir, "generated", "some-buildpack-id"), 0755)
 				h.AssertNil(t, err)
-			}
-			if extensionsForRun {
-				type runImage struct {
-					Extend bool `toml:"extend,omitempty"`
-				}
-				type analyzedMD struct {
-					RunImage *runImage `toml:"run-image,omitempty"`
-				}
-				var amd analyzedMD
-				amd.RunImage = &runImage{Extend: true}
-				f, err := os.Create(filepath.Join(tmpDir, "analyzed.toml"))
+				_, err = os.Create(filepath.Join(tmpDir, "generated", "some-buildpack-id", "build.Dockerfile"))
 				h.AssertNil(t, err)
-				toml.NewEncoder(f).Encode(amd)
-				h.AssertNil(t, f.Close())
 			}
 		}
+		amd := files.Analyzed{RunImage: &files.RunImage{
+			Extend: false,
+			Image:  "",
+		}}
+		if extensionsForRun {
+			amd.RunImage.Extend = true
+		}
+		if extensionsRunImageName != "" {
+			amd.RunImage.Image = extensionsRunImageName
+		}
+		if extensionsRunImageIdentifier != "" {
+			amd.RunImage.Reference = extensionsRunImageIdentifier
+		}
+		f, err := os.Create(filepath.Join(tmpDir, "analyzed.toml"))
+		h.AssertNil(t, err)
+		toml.NewEncoder(f).Encode(amd)
+		h.AssertNil(t, f.Close())
 
 		fakeLaunchCache = fakes.NewFakeCache()
 		fakeLaunchCache.ReturnForType = cache.Volume
 		fakeLaunchCache.ReturnForName = "some-launch-cache"
+
+		fakeKanikoCache = fakes.NewFakeCache()
+		fakeKanikoCache.ReturnForType = cache.Volume
+		fakeKanikoCache.ReturnForName = "some-kaniko-cache"
 
 		fakePhase = &fakes.FakePhase{}
 		fakePhaseFactory = fakes.NewFakePhaseFactory(fakes.WhichReturnsForNew(fakePhase))
@@ -255,7 +276,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			fakeBuilder *fakes.FakeBuilder
 			outBuf      bytes.Buffer
 			logger      *logging.LogWithWriters
-			docker      *client.Client
+			docker      *fakeDockerClient
 			fakeTermui  *fakes.FakeTermui
 		)
 
@@ -269,7 +290,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			fakeBuilder, err = fakes.NewFakeBuilder(fakes.WithSupportedPlatformAPIs([]*api.Version{api.MustParse("0.3")}))
 			h.AssertNil(t, err)
 			logger = logging.NewLogWithWriters(&outBuf, &outBuf)
-			docker, err = client.NewClientWithOpts(client.FromEnv, client.WithVersion("1.38"))
+			docker = &fakeDockerClient{}
 			h.AssertNil(t, err)
 			fakePhaseFactory = fakes.NewFakePhaseFactory()
 		})
@@ -369,6 +390,25 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 							return fakePhaseFactory
 						})
 						h.AssertNotNil(t, err)
+					})
+
+					when("use creator with extensions supported by the lifecycle", func() {
+						useCreatorWithExtensions = true
+
+						it("allows the build to proceed (but the creator will error if extensions are detected)", func() {
+							err := lifecycle.Run(context.Background(), func(execution *build.LifecycleExecution) build.PhaseFactory {
+								return fakePhaseFactory
+							})
+							h.AssertNil(t, err)
+
+							h.AssertEq(t, len(fakePhaseFactory.NewCalledWithProvider), 1)
+
+							for _, entry := range fakePhaseFactory.NewCalledWithProvider {
+								if entry.Name() == "creator" {
+									h.AssertSliceContains(t, entry.ContainerConfig().Cmd, providedTargetImage)
+								}
+							}
+						})
 					})
 				})
 			})
@@ -545,9 +585,35 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 			when("extensions", func() {
 				providedUseCreator = false
+				providedOrderExt = dist.Order{dist.OrderEntry{Group: []dist.ModuleRef{ /* don't care */ }}}
 
 				when("for build", func() {
-					when("present <layers>/generated/build", func() {
+					when("present in <layers>/generated/<buildpack-id>", func() {
+						extensionsForBuild = true
+
+						when("platform >= 0.13", func() {
+							platformAPI = api.MustParse("0.13")
+
+							it("runs the extender (build)", func() {
+								err := lifecycle.Run(context.Background(), func(execution *build.LifecycleExecution) build.PhaseFactory {
+									return fakePhaseFactory
+								})
+								h.AssertNil(t, err)
+
+								h.AssertEq(t, len(fakePhaseFactory.NewCalledWithProvider), 5)
+
+								var found bool
+								for _, entry := range fakePhaseFactory.NewCalledWithProvider {
+									if entry.Name() == "extender" {
+										found = true
+									}
+								}
+								h.AssertEq(t, found, true)
+							})
+						})
+					})
+
+					when("present in <layers>/generated/build", func() {
 						extensionsForBuild = true
 
 						when("platform < 0.10", func() {
@@ -571,7 +637,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 							})
 						})
 
-						when("platform >= 0.10", func() {
+						when("platform 0.10 to 0.12", func() {
 							platformAPI = api.MustParse("0.10")
 
 							it("runs the extender (build)", func() {
@@ -616,7 +682,34 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 				})
 
 				when("for run", func() {
-					when("analyzed.toml extend", func() {
+					when("analyzed.toml run image", func() {
+						when("matches provided run image", func() {
+							it("does nothing", func() {
+								err := lifecycle.Run(context.Background(), func(execution *build.LifecycleExecution) build.PhaseFactory {
+									return fakePhaseFactory
+								})
+								h.AssertNil(t, err)
+								h.AssertEq(t, fakeFetcher.callCount, 0)
+							})
+						})
+
+						when("does not match provided run image", func() {
+							extensionsRunImageName = "some-new-run-image"
+							extensionsRunImageIdentifier = "some-new-run-image-identifier"
+
+							it("pulls the new run image", func() {
+								err := lifecycle.Run(context.Background(), func(execution *build.LifecycleExecution) build.PhaseFactory {
+									return fakePhaseFactory
+								})
+								h.AssertNil(t, err)
+								h.AssertEq(t, fakeFetcher.callCount, 2)
+								h.AssertEq(t, fakeFetcher.calledWithArgAtCall[0], "some-new-run-image")
+								h.AssertEq(t, fakeFetcher.calledWithArgAtCall[1], "some-new-run-image-identifier")
+							})
+						})
+					})
+
+					when("analyzed.toml run image extend", func() {
 						when("true", func() {
 							extensionsForRun = true
 
@@ -685,6 +778,46 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 						})
 					})
 				})
+			})
+		})
+
+		when("network is not provided", func() {
+			it("creates an ephemeral bridge network", func() {
+				beforeNetworks := func() int {
+					networks, err := docker.NetworkList(context.Background(), network.CreateOptions{})
+					h.AssertNil(t, err)
+					return len(networks)
+				}()
+
+				opts := build.LifecycleOptions{
+					Image:   imageName,
+					Builder: fakeBuilder,
+					Termui:  fakeTermui,
+				}
+
+				lifecycle, err := build.NewLifecycleExecution(logger, docker, "some-temp-dir", opts)
+				h.AssertNil(t, err)
+
+				err = lifecycle.Run(context.Background(), func(execution *build.LifecycleExecution) build.PhaseFactory {
+					return fakePhaseFactory
+				})
+				h.AssertNil(t, err)
+
+				for _, entry := range fakePhaseFactory.NewCalledWithProvider {
+					h.AssertContains(t, string(entry.HostConfig().NetworkMode), "pack.local-network-")
+					h.AssertEq(t, entry.HostConfig().NetworkMode.IsDefault(), false)
+					h.AssertEq(t, entry.HostConfig().NetworkMode.IsHost(), false)
+					h.AssertEq(t, entry.HostConfig().NetworkMode.IsNone(), false)
+					h.AssertEq(t, entry.HostConfig().NetworkMode.IsPrivate(), true)
+					h.AssertEq(t, entry.HostConfig().NetworkMode.IsUserDefined(), true)
+				}
+
+				afterNetworks := func() int {
+					networks, err := docker.NetworkList(context.Background(), network.CreateOptions{})
+					h.AssertNil(t, err)
+					return len(networks)
+				}()
+				h.AssertEq(t, beforeNetworks, afterNetworks)
 			})
 		})
 
@@ -1015,6 +1148,31 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 				it("gid is not added to the expected arguments", func() {
 					h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-gid")
+				})
+			})
+		})
+
+		when("override UID", func() {
+			when("override UID is provided", func() {
+				lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+					options.UID = 1001
+				})
+
+				it("configures the phase with the expected arguments", func() {
+					h.AssertIncludeAllExpectedPatterns(t,
+						configProvider.ContainerConfig().Cmd,
+						[]string{"-uid", "1001"},
+					)
+				})
+			})
+
+			when("override UID is not provided", func() {
+				lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+					options.UID = -1
+				})
+
+				it("uid is not added to the expected arguments", func() {
+					h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-uid")
 				})
 			})
 		})
@@ -1360,6 +1518,32 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			})
 		})
 
+		when("platform >= 0.12", func() {
+			platformAPI = api.MustParse("0.12")
+
+			it("passes run", func() {
+				h.AssertIncludeAllExpectedPatterns(t,
+					configProvider.ContainerConfig().Cmd,
+					[]string{"-run", "/layers/run.toml"},
+				)
+				h.AssertSliceNotContains(t,
+					configProvider.ContainerConfig().Cmd,
+					"-stack",
+				)
+			})
+
+			when("layout is true", func() {
+				providedLayout = true
+
+				it("configures the phase with the expected environment variables", func() {
+					layoutDir := filepath.Join(paths.RootDir, "layout-repo")
+					h.AssertSliceContains(t,
+						configProvider.ContainerConfig().Env, "CNB_USE_LAYOUT=true", fmt.Sprintf("CNB_LAYOUT_DIR=%s", layoutDir),
+					)
+				})
+			})
+		})
+
 		when("publish", func() {
 			providedPublish = true
 
@@ -1507,6 +1691,31 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 						})
 					})
 				})
+
+				when("override UID", func() {
+					when("override UID is provided", func() {
+						lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+							options.UID = 1001
+						})
+
+						it("configures the phase with the expected arguments", func() {
+							h.AssertIncludeAllExpectedPatterns(t,
+								configProvider.ContainerConfig().Cmd,
+								[]string{"-uid", "1001"},
+							)
+						})
+					})
+
+					when("override UID is not provided", func() {
+						lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+							options.UID = -1
+						})
+
+						it("uid is not added to the expected arguments", func() {
+							h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-uid")
+						})
+					})
+				})
 			})
 		})
 
@@ -1601,7 +1810,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 	when("#Restore", func() {
 		it.Before(func() {
-			err := lifecycle.Restore(context.Background(), fakeBuildCache, fakePhaseFactory)
+			err := lifecycle.Restore(context.Background(), fakeBuildCache, fakeKanikoCache, fakePhaseFactory)
 			h.AssertNil(t, err)
 
 			lastCallIndex := len(fakePhaseFactory.NewCalledWithProvider) - 1
@@ -1653,6 +1862,27 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			h.AssertSliceContains(t, configProvider.HostConfig().Binds, expectedBind)
 		})
 
+		when("there are extensions", func() {
+			platformAPI = api.MustParse("0.12")
+			providedOrderExt = dist.Order{dist.OrderEntry{Group: []dist.ModuleRef{ /* don't care */ }}}
+
+			when("for build", func() {
+				extensionsForBuild = true
+
+				it("configures the phase with registry access", func() {
+					h.AssertSliceContains(t, configProvider.ContainerConfig().Env, "CNB_REGISTRY_AUTH={}")
+				})
+			})
+
+			when("for run", func() {
+				extensionsForRun = true
+
+				it("configures the phase with registry access", func() {
+					h.AssertSliceContains(t, configProvider.ContainerConfig().Env, "CNB_REGISTRY_AUTH={}")
+				})
+			})
+		})
+
 		when("using cache image", func() {
 			fakeBuildCache = newFakeImageCache()
 
@@ -1695,6 +1925,31 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			})
 		})
 
+		when("override UID", func() {
+			when("override UID is provided", func() {
+				lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+					options.UID = 1001
+				})
+
+				it("configures the phase with the expected arguments", func() {
+					h.AssertIncludeAllExpectedPatterns(t,
+						configProvider.ContainerConfig().Cmd,
+						[]string{"-uid", "1001"},
+					)
+				})
+			})
+
+			when("override UID is not provided", func() {
+				lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+					options.UID = -1
+				})
+
+				it("uid is not added to the expected arguments", func() {
+					h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-uid")
+				})
+			})
+		})
+
 		when("--clear-cache", func() {
 			providedClearCache = true
 
@@ -1704,6 +1959,8 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 		})
 
 		when("extensions", func() {
+			providedOrderExt = dist.Order{dist.OrderEntry{Group: []dist.ModuleRef{ /* don't care */ }}}
+
 			when("for build", func() {
 				when("present in <layers>/generated/build", func() {
 					extensionsForBuild = true
@@ -1713,7 +1970,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 						it("does not provide -build-image or /kaniko bind", func() {
 							h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-build-image")
-							h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-cache:/kaniko")
+							h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-kaniko-cache:/kaniko")
 						})
 					})
 
@@ -1723,7 +1980,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 						it("provides -build-image and /kaniko bind", func() {
 							h.AssertSliceContainsInOrder(t, configProvider.ContainerConfig().Cmd, "-build-image", providedBuilderImage)
 							h.AssertSliceContains(t, configProvider.ContainerConfig().Env, "CNB_REGISTRY_AUTH={}")
-							h.AssertSliceContains(t, configProvider.HostConfig().Binds, "some-cache:/kaniko")
+							h.AssertSliceContains(t, configProvider.HostConfig().Binds, "some-kaniko-cache:/kaniko")
 						})
 					})
 				})
@@ -1733,7 +1990,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 					it("does not provide -build-image or /kaniko bind", func() {
 						h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-build-image")
-						h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-cache:/kaniko")
+						h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-kaniko-cache:/kaniko")
 					})
 				})
 			})
@@ -1747,7 +2004,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 							platformAPI = api.MustParse("0.12")
 
 							it("provides /kaniko bind", func() {
-								h.AssertSliceContains(t, configProvider.HostConfig().Binds, "some-cache:/kaniko")
+								h.AssertSliceContains(t, configProvider.HostConfig().Binds, "some-kaniko-cache:/kaniko")
 							})
 						})
 
@@ -1755,7 +2012,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 							platformAPI = api.MustParse("0.11")
 
 							it("does not provide /kaniko bind", func() {
-								h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-cache:/kaniko")
+								h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-kaniko-cache:/kaniko")
 							})
 						})
 					})
@@ -1764,9 +2021,46 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 						platformAPI = api.MustParse("0.12")
 
 						it("does not provide /kaniko bind", func() {
-							h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-cache:/kaniko")
+							h.AssertSliceNotContains(t, configProvider.HostConfig().Binds, "some-kaniko-cache:/kaniko")
 						})
 					})
+				})
+			})
+		})
+
+		when("publish is false", func() {
+			when("platform >= 0.12", func() {
+				platformAPI = api.MustParse("0.12")
+
+				it("configures the phase with daemon access", func() {
+					h.AssertEq(t, configProvider.ContainerConfig().User, "root")
+					h.AssertSliceContains(t, configProvider.HostConfig().Binds, "/var/run/docker.sock:/var/run/docker.sock")
+				})
+
+				it("configures the phase with the expected arguments", func() {
+					h.AssertIncludeAllExpectedPatterns(t,
+						configProvider.ContainerConfig().Cmd,
+						[]string{"-daemon"},
+					)
+				})
+			})
+		})
+
+		when("layout is true", func() {
+			when("platform >= 0.12", func() {
+				platformAPI = api.MustParse("0.12")
+				providedLayout = true
+
+				it("it configures the phase with access to provided volumes", func() {
+					// this is required to read the /layout-repo
+					h.AssertSliceContains(t, configProvider.HostConfig().Binds, providedVolumes...)
+				})
+
+				it("configures the phase with the expected environment variables", func() {
+					layoutDir := filepath.Join(paths.RootDir, "layout-repo")
+					h.AssertSliceContains(t,
+						configProvider.ContainerConfig().Env, "CNB_USE_LAYOUT=true", fmt.Sprintf("CNB_LAYOUT_DIR=%s", layoutDir),
+					)
 				})
 			})
 		})
@@ -1806,8 +2100,10 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 	})
 
 	when("#ExtendBuild", func() {
+		var experimental bool
 		it.Before(func() {
-			err := lifecycle.ExtendBuild(context.Background(), fakeBuildCache, fakePhaseFactory)
+			experimental = true
+			err := lifecycle.ExtendBuild(context.Background(), fakeKanikoCache, fakePhaseFactory, experimental)
 			h.AssertNil(t, err)
 
 			lastCallIndex := len(fakePhaseFactory.NewCalledWithProvider) - 1
@@ -1829,7 +2125,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 		it("configures the phase with binds", func() {
 			expectedBinds := providedVolumes
-			expectedBinds = append(expectedBinds, "some-cache:/kaniko")
+			expectedBinds = append(expectedBinds, "some-kaniko-cache:/kaniko")
 
 			h.AssertSliceContains(t, configProvider.HostConfig().Binds, expectedBinds...)
 		})
@@ -1845,11 +2141,31 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 		it("configures the phase with root", func() {
 			h.AssertEq(t, configProvider.ContainerConfig().User, "root")
 		})
+
+		when("experimental is false", func() {
+			it.Before(func() {
+				experimental = false
+				err := lifecycle.ExtendBuild(context.Background(), fakeKanikoCache, fakePhaseFactory, experimental)
+				h.AssertNil(t, err)
+
+				lastCallIndex := len(fakePhaseFactory.NewCalledWithProvider) - 1
+				h.AssertNotEq(t, lastCallIndex, -1)
+
+				configProvider = fakePhaseFactory.NewCalledWithProvider[lastCallIndex]
+				h.AssertEq(t, configProvider.Name(), "extender")
+			})
+
+			it("CNB_EXPERIMENTAL_MODE=warn is not enable in the environment", func() {
+				h.AssertSliceNotContains(t, configProvider.ContainerConfig().Env, "CNB_EXPERIMENTAL_MODE=warn")
+			})
+		})
 	})
 
 	when("#ExtendRun", func() {
+		var experimental bool
 		it.Before(func() {
-			err := lifecycle.ExtendRun(context.Background(), fakeBuildCache, fakePhaseFactory)
+			experimental = true
+			err := lifecycle.ExtendRun(context.Background(), fakeKanikoCache, fakePhaseFactory, "some-run-image", experimental)
 			h.AssertNil(t, err)
 
 			lastCallIndex := len(fakePhaseFactory.NewCalledWithProvider) - 1
@@ -1877,7 +2193,7 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 
 		it("configures the phase with binds", func() {
 			expectedBinds := providedVolumes
-			expectedBinds = append(expectedBinds, "some-cache:/kaniko", fmt.Sprintf("%s:/cnb", filepath.Join(tmpDir, "cnb")))
+			expectedBinds = append(expectedBinds, "some-kaniko-cache:/kaniko")
 
 			h.AssertSliceContains(t, configProvider.HostConfig().Binds, expectedBinds...)
 		})
@@ -1893,11 +2209,29 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 		it("configures the phase with root", func() {
 			h.AssertEq(t, configProvider.ContainerConfig().User, "root")
 		})
+
+		when("experimental is false", func() {
+			it.Before(func() {
+				experimental = false
+				err := lifecycle.ExtendRun(context.Background(), fakeKanikoCache, fakePhaseFactory, "some-run-image", experimental)
+				h.AssertNil(t, err)
+
+				lastCallIndex := len(fakePhaseFactory.NewCalledWithProvider) - 1
+				h.AssertNotEq(t, lastCallIndex, -1)
+
+				configProvider = fakePhaseFactory.NewCalledWithProvider[lastCallIndex]
+				h.AssertEq(t, configProvider.Name(), "extender")
+			})
+
+			it("CNB_EXPERIMENTAL_MODE=warn is not enable in the environment", func() {
+				h.AssertSliceNotContains(t, configProvider.ContainerConfig().Env, "CNB_EXPERIMENTAL_MODE=warn")
+			})
+		})
 	})
 
 	when("#Export", func() {
 		it.Before(func() {
-			err := lifecycle.Export(context.Background(), fakeBuildCache, fakeLaunchCache, fakePhaseFactory)
+			err := lifecycle.Export(context.Background(), fakeBuildCache, fakeLaunchCache, fakeKanikoCache, fakePhaseFactory)
 			h.AssertNil(t, err)
 
 			lastCallIndex := len(fakePhaseFactory.NewCalledWithProvider) - 1
@@ -1935,13 +2269,37 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 				h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-stack")
 			})
 
-			when("extensions", func() {
+			when("there are extensions", func() {
+				providedOrderExt = dist.Order{dist.OrderEntry{Group: []dist.ModuleRef{ /* don't care */ }}}
+
 				when("for run", func() {
 					extensionsForRun = true
 
 					it("sets CNB_EXPERIMENTAL_MODE=warn in the environment", func() {
 						h.AssertSliceContains(t, configProvider.ContainerConfig().Env, "CNB_EXPERIMENTAL_MODE=warn")
 					})
+
+					it("configures the phase with binds", func() {
+						expectedBinds := []string{"some-cache:/cache", "some-launch-cache:/launch-cache", "some-kaniko-cache:/kaniko"}
+
+						h.AssertSliceContains(t, configProvider.HostConfig().Binds, expectedBinds...)
+					})
+				})
+			})
+
+			when("layout is true", func() {
+				providedLayout = true
+
+				it("it configures the phase with access to provided volumes", func() {
+					// this is required to read the /layout-repo
+					h.AssertSliceContains(t, configProvider.HostConfig().Binds, providedVolumes...)
+				})
+
+				it("configures the phase with the expected environment variables", func() {
+					layoutDir := filepath.Join(paths.RootDir, "layout-repo")
+					h.AssertSliceContains(t,
+						configProvider.ContainerConfig().Env, "CNB_USE_LAYOUT=true", fmt.Sprintf("CNB_LAYOUT_DIR=%s", layoutDir),
+					)
 				})
 			})
 		})
@@ -2203,6 +2561,31 @@ func testLifecycleExecution(t *testing.T, when spec.G, it spec.S) {
 			})
 		})
 
+		when("override UID", func() {
+			when("override UID is provided", func() {
+				lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+					options.UID = 1001
+				})
+
+				it("configures the phase with the expected arguments", func() {
+					h.AssertIncludeAllExpectedPatterns(t,
+						configProvider.ContainerConfig().Cmd,
+						[]string{"-uid", "1001"},
+					)
+				})
+			})
+
+			when("override UID is not provided", func() {
+				lifecycleOps = append(lifecycleOps, func(options *build.LifecycleOptions) {
+					options.UID = -1
+				})
+
+				it("uid is not added to the expected arguments", func() {
+					h.AssertSliceNotContains(t, configProvider.ContainerConfig().Cmd, "-uid")
+				})
+			})
+		})
+
 		when("interactive mode", func() {
 			lifecycleOps = append(lifecycleOps, func(opts *build.LifecycleOptions) {
 				opts.Interactive = true
@@ -2296,6 +2679,43 @@ func newFakeImageCache() *fakes.FakeCache {
 	c.ReturnForType = cache.Image
 	c.ReturnForName = "some-cache-image"
 	return c
+}
+
+func newFakeFetchRunImageFunc(f *fakeImageFetcher) func(name string) (string, error) {
+	return func(name string) (string, error) {
+		return fmt.Sprintf("ephemeral-%s", name), f.fetchRunImage(name)
+	}
+}
+
+type fakeImageFetcher struct {
+	callCount           int
+	calledWithArgAtCall map[int]string
+}
+
+func (f *fakeImageFetcher) fetchRunImage(name string) error {
+	f.calledWithArgAtCall[f.callCount] = name
+	f.callCount++
+	return nil
+}
+
+type fakeDockerClient struct {
+	nNetworks int
+	build.DockerClient
+}
+
+func (f *fakeDockerClient) NetworkList(ctx context.Context, opts network.CreateOptions) ([]network.Inspect, error) {
+	ret := make([]network.Inspect, f.nNetworks)
+	return ret, nil
+}
+
+func (f *fakeDockerClient) NetworkCreate(ctx context.Context, name string, options network.CreateOptions) (network.CreateResponse, error) {
+	f.nNetworks++
+	return network.CreateResponse{}, nil
+}
+
+func (f *fakeDockerClient) NetworkRemove(ctx context.Context, network string) error {
+	f.nNetworks--
+	return nil
 }
 
 func newTestLifecycleExecErr(t *testing.T, logVerbose bool, tmpDir string, ops ...func(*build.LifecycleOptions)) (*build.LifecycleExecution, error) {

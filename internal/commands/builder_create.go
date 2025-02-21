@@ -10,6 +10,7 @@ import (
 	"github.com/buildpacks/pack/builder"
 	"github.com/buildpacks/pack/internal/config"
 	"github.com/buildpacks/pack/internal/style"
+	"github.com/buildpacks/pack/pkg/buildpack"
 	"github.com/buildpacks/pack/pkg/client"
 	"github.com/buildpacks/pack/pkg/image"
 	"github.com/buildpacks/pack/pkg/logging"
@@ -17,10 +18,14 @@ import (
 
 // BuilderCreateFlags define flags provided to the CreateBuilder command
 type BuilderCreateFlags struct {
-	BuilderTomlPath string
-	Publish         bool
-	Registry        string
-	Policy          string
+	Publish               bool
+	AppendImageNameSuffix bool
+	BuilderTomlPath       string
+	Registry              string
+	Policy                string
+	Flatten               []string
+	Targets               []string
+	Label                 map[string]string
 }
 
 // CreateBuilder creates a builder image, based on a builder config
@@ -71,14 +76,45 @@ Creating a custom builder allows you to control what buildpacks are used and wha
 				return errors.Wrap(err, "getting absolute path for config")
 			}
 
+			envMap, warnings, err := builder.ParseBuildConfigEnv(builderConfig.Build.Env, flags.BuilderTomlPath)
+			for _, v := range warnings {
+				logger.Warn(v)
+			}
+			if err != nil {
+				return err
+			}
+
+			toFlatten, err := buildpack.ParseFlattenBuildModules(flags.Flatten)
+			if err != nil {
+				return err
+			}
+
+			multiArchCfg, err := processMultiArchitectureConfig(logger, flags.Targets, builderConfig.Targets, !flags.Publish)
+			if err != nil {
+				return err
+			}
+
+			if len(multiArchCfg.Targets()) == 0 {
+				logger.Infof("Pro tip: use --targets flag OR [[targets]] in builder.toml to specify the desired platform")
+			}
+
+			if !flags.Publish && flags.AppendImageNameSuffix {
+				logger.Warnf("--append-image-name-suffix will be ignored, use combined with --publish")
+			}
+
 			imageName := args[0]
 			if err := pack.CreateBuilder(cmd.Context(), client.CreateBuilderOptions{
-				RelativeBaseDir: relativeBaseDir,
-				BuilderName:     imageName,
-				Config:          builderConfig,
-				Publish:         flags.Publish,
-				Registry:        flags.Registry,
-				PullPolicy:      pullPolicy,
+				RelativeBaseDir:       relativeBaseDir,
+				BuildConfigEnv:        envMap,
+				BuilderName:           imageName,
+				Config:                builderConfig,
+				Publish:               flags.Publish,
+				AppendImageNameSuffix: flags.AppendImageNameSuffix && flags.Publish,
+				Registry:              flags.Registry,
+				PullPolicy:            pullPolicy,
+				Flatten:               toFlatten,
+				Labels:                flags.Label,
+				Targets:               multiArchCfg.Targets(),
 			}); err != nil {
 				return err
 			}
@@ -93,8 +129,17 @@ Creating a custom builder allows you to control what buildpacks are used and wha
 		cmd.Flags().MarkHidden("buildpack-registry")
 	}
 	cmd.Flags().StringVarP(&flags.BuilderTomlPath, "config", "c", "", "Path to builder TOML file (required)")
-	cmd.Flags().BoolVar(&flags.Publish, "publish", false, "Publish to registry")
+	cmd.Flags().BoolVar(&flags.Publish, "publish", false, "Publish the builder directly to the container registry specified in <image-name>, instead of the daemon.")
+	cmd.Flags().BoolVar(&flags.AppendImageNameSuffix, "append-image-name-suffix", false, "When publishing to a registry that doesn't allow overwrite existing tags use this flag to append a [os]-[arch] suffix to <image-name>")
 	cmd.Flags().StringVar(&flags.Policy, "pull-policy", "", "Pull policy to use. Accepted values are always, never, and if-not-present. The default is always")
+	cmd.Flags().StringArrayVar(&flags.Flatten, "flatten", nil, "List of buildpacks to flatten together into a single layer (format: '<buildpack-id>@<buildpack-version>,<buildpack-id>@<buildpack-version>'")
+	cmd.Flags().StringToStringVarP(&flags.Label, "label", "l", nil, "Labels to add to the builder image, in the form of '<name>=<value>'")
+	cmd.Flags().StringSliceVarP(&flags.Targets, "target", "t", nil,
+		`Target platforms to build for.\nTargets should be in the format '[os][/arch][/variant]:[distroname@osversion@anotherversion];[distroname@osversion]'.
+- To specify two different architectures:  '--target "linux/amd64" --target "linux/arm64"'
+- To specify the distribution version: '--target "linux/arm/v6:ubuntu@14.04"'
+- To specify multiple distribution versions: '--target "linux/arm/v6:ubuntu@14.04"  --target "linux/arm/v6:ubuntu@16.04"'
+	`)
 
 	AddHelpFlag(cmd, "create")
 	return cmd
